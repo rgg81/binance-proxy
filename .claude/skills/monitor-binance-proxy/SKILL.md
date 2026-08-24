@@ -84,6 +84,20 @@ something is broken:
    found either a candle cached past its true closed_boundary (a violation
    of CLAUDE.md invariant #1/#9) or a malformed coverage range. Both are
    serious — this is the exact class of bug this project has had before.
+6. For a `live_candle` failure: this is `cache_integrity`'s complement —
+   where that one only proves nothing bad is *currently* sitting in the
+   DB, this one actively exercises the live-tail fetch path right now and
+   checks two things: `agrees_with_real=False` means the proxy and a live
+   Binance call disagree on the open candle's identity/opening price (a
+   real correctness problem); `not_persisted=False` means the still-forming
+   candle was found in the cache — the exact failure mode invariant #1
+   exists to prevent. This check was specifically validated (not just
+   trusted) to catch a real instance of the latter: a fabricated row was
+   planted at the open candle's `open_time` on an isolated test instance,
+   and the check correctly failed with `not_persisted=False` while still
+   correctly reporting `agrees_with_real=True` (the live response itself
+   was unaffected, fetched fresh) — see the commit history for the
+   isolated reproduction.
 
 Once you've determined whether it's a real problem:
 

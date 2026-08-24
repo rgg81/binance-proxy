@@ -294,6 +294,80 @@ async def _gather_n(fetch: Callable[[], Awaitable[object]], n: int) -> list[obje
     return await asyncio.gather(*[fetch() for _ in range(n)])
 
 
+def check_live_candle(client: httpx.Client, real: httpx.Client, db_path: Path) -> CheckResult:
+    """Every other check above deliberately avoids the still-forming candle
+    (windows are 50min-2.5h in the past) — comparing it byte-for-byte
+    against a second, slightly-later Binance call would be flaky by nature:
+    a new trade can legitimately land between the two calls, changing
+    close/high/volume/trade-count with no bug involved. That's exactly why
+    those checks use firmly historical windows instead. But that leaves the
+    live-tail fetch path itself — the mechanism that serves "now" — never
+    actively exercised by any live check; check_cache_integrity only proves
+    nothing bad is *currently* sitting in the DB, not that this code path is
+    working right now on the deployed system.
+
+    This check exercises it directly, comparing only what's actually stable
+    about an in-progress candle (which one is open, and its opening price —
+    fixed the instant the candle starts, unlike close/high/volume) and
+    verifying — by reading the DB immediately after — that it was not
+    persisted. Uses a spot symbol deliberately: real production traffic is
+    100% futures, so there's no risk of this racing against real traffic
+    into the same cache rows.
+    """
+    from binance_proxy.intervals import interval_to_ms
+
+    interval_ms = interval_to_ms("1m")
+    symbol = "ETHUSDT"
+    now_ms = _now_ms()
+    closed_boundary = (now_ms // interval_ms) * interval_ms
+    params: dict[str, str | int] = {
+        "symbol": symbol,
+        "interval": "1m",
+        "startTime": closed_boundary,
+        "limit": 1,
+    }
+
+    try:
+        proxy_resp = client.get("/api/v3/klines", params=params, timeout=15).json()
+        real_resp = real.get(
+            f"{REAL_SPOT_BASE}/api/v3/klines", params=params, timeout=15
+        ).json()
+    except httpx.HTTPError as exc:
+        return CheckResult("live_candle", False, f"request failed: {exc}")
+
+    if not (isinstance(proxy_resp, list) and proxy_resp):
+        return CheckResult("live_candle", False, f"expected the open candle, got {proxy_resp!r}")
+    if not (isinstance(real_resp, list) and real_resp):
+        return CheckResult("live_candle", False, f"real Binance returned {real_resp!r}")
+
+    proxy_open_time, proxy_open_price = proxy_resp[0][0], proxy_resp[0][1]
+    real_open_time, real_open_price = real_resp[0][0], real_resp[0][1]
+    # Tolerate a one-interval difference: the check's own closed_boundary
+    # computation can straddle a real minute rollover between here and the
+    # two HTTP calls.
+    agrees_with_real = (
+        abs(proxy_open_time - real_open_time) <= interval_ms
+        and (proxy_open_time != real_open_time or proxy_open_price == real_open_price)
+    )
+
+    conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
+    (persisted_count,) = conn.execute(
+        "SELECT COUNT(*) FROM klines WHERE market='spot' AND symbol=? AND interval='1m' "
+        "AND open_time=?",
+        (symbol, proxy_open_time),
+    ).fetchone()
+    conn.close()
+    not_persisted = persisted_count == 0
+
+    ok = agrees_with_real and not_persisted
+    return CheckResult(
+        "live_candle",
+        ok,
+        f"proxy_open_time={proxy_open_time} real_open_time={real_open_time} "
+        f"agrees_with_real={agrees_with_real} not_persisted={not_persisted}",
+    )
+
+
 # -- 6. cache integrity, read directly from disk -----------------------------
 
 
@@ -365,6 +439,7 @@ def run_all(proxy_url: str, skip_code_quality: bool, db_path: Path) -> list[Chec
             results.append(check_cache_hit(client))
             results.append(check_cache_served_fidelity(client, real))
             results.append(check_coalescing(client))
+            results.append(check_live_candle(client, real, db_path))
 
         results.append(check_cache_integrity(db_path))
 
