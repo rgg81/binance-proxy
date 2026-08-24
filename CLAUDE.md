@@ -37,10 +37,26 @@ codebase; regressions here mean real Binance bans in production.
    (now_ms // interval_ms) * interval_ms` and never lets cache coverage
    extend past it. If you touch gap-fill logic, re-run
    `tests/integration/test_service.py::TestLiveTail` and make sure it still
-   asserts zero persisted rows for the open candle.
+   asserts zero persisted rows for the open candle. Relatedly,
+   `live_tail_range`'s start is `max(start, closed_boundary)`, not
+   `closed_boundary` alone — a request whose own `start` is already past
+   `closed_boundary` (including a genuinely future `startTime`) must fetch
+   from its own `start`, or the proxy fabricates the live candle in place
+   of the empty result Binance itself returns for a future range. This was
+   a real, confirmed bug (verified live: proxy returned a fake current
+   candle for a future startTime before the fix, `[]` after).
 2. **`timezone` is part of a series' identity**, not an afterthought —
    Binance's `timeZone` param shifts candle boundaries for intervals ≥ 1d.
-   `SeriesKey` includes it; don't collapse it out for convenience.
+   `SeriesKey` includes it; don't collapse it out for convenience. Further:
+   **any non-`"0"` timezone bypasses the coverage-READ/gap-fill path
+   entirely** (`KlineService.get_klines`'s dispatch condition) — the
+   `closed_boundary` math is UTC-only and cannot be trusted to shift
+   correctly for other offsets. This was a real, confirmed bug (a
+   still-forming shifted daily candle got permanently mis-cached); see
+   `TestNonUtcTimezoneBypassesTheCache` for the numeric reproduction. The
+   bypass only disables the boundary-based *read*; passthrough may still
+   safely cache a row via its own `close_time` from Binance, which is
+   ground truth regardless of timezone.
 3. **This proxy is single-process by design.** Coalescing (`coalescing.py`)
    and rate limiting (`upstream/rate_limiter.py`) hold in-memory state with
    no cross-process coordination. Do not add `uvicorn --workers N` or run
@@ -64,6 +80,25 @@ codebase; regressions here mean real Binance bans in production.
    incorrectness at month/DST boundaries. If real demand for cached `1M`
    data appears, it needs its own calendar-aware coverage representation,
    not a fudge factor on the existing one.
+7. **Binance's `endTime` is inclusive** (open_time ≤ endTime), confirmed
+   live against the real API. `plan_fetch`'s `end` is a half-open exclusive
+   boundary; `KlineService.get_klines` converts once (`end_time + 1`) at
+   the seam where a client's raw endTime enters the internal arithmetic.
+   Do not pass a client's raw `end_time` into `plan_fetch` un-converted —
+   this was a real, confirmed bug (silently dropped the last candle of any
+   candle-aligned range query).
+8. **Every code path that writes to `coverage` for a series must hold
+   `coalescer.series_lock(key)` for the duration of the write** —
+   `KlineStore.add_coverage` is a non-atomic read-merge-write and two
+   concurrent unlocked callers can lose one of their ranges (confirmed by
+   direct reproduction). This includes `_fetch_passthrough`, not just the
+   range path — it was a real, confirmed bug that it didn't.
+9. **`_fill_gap` must never trust the requested `[start, end)` shape** —
+   it derives what to persist/cover from which returned rows are actually
+   closed (`close_time < now_ms`), the same way `_fetch_live_tail` and
+   `_fetch_passthrough` do. This is deliberate defense-in-depth against
+   any future way `closed_boundary` might be computed wrong, not just the
+   timezone case invariant #2 already closes off.
 
 ## Architecture map
 

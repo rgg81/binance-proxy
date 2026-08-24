@@ -98,10 +98,22 @@ class KlineService:
         limit: int,
         now_ms: int,
     ) -> list[list[int | str]]:
-        # Open-ended "tail" requests and the variable-length "1M" interval
-        # can't use the fixed-duration coverage/gap-fill machinery — they
-        # always take the always-live (but still coalesced) passthrough path.
-        if start_time is None or key.interval == "1M":
+        # Open-ended "tail" requests, the variable-length "1M" interval, and
+        # any non-UTC timeZone all bypass the coverage-READ / gap-fill
+        # machinery (plan_fetch below). closed_boundary assumes UTC-aligned
+        # candle boundaries; a non-"0" timeZone shifts those boundaries for
+        # intervals >= 1d (see SeriesKey's docstring), which this arithmetic
+        # does not — and, given Binance's per-offset boundary rules,
+        # realistically cannot cheaply — account for. Without this bypass a
+        # still-forming shifted candle can be misclassified as historical
+        # and permanently mis-cached; see CLAUDE.md invariant #1.
+        #
+        # This only disables the unsafe boundary-based READ path — the
+        # passthrough fetch below may still opportunistically persist rows
+        # it fetches, safely, using each row's own close_time from Binance
+        # (ground truth, correctly timezone-aware since Binance computed
+        # it) rather than this module's own boundary math.
+        if start_time is None or key.interval == "1M" or key.timezone != "0":
             return await self._fetch_passthrough(
                 key, start_time=start_time, end_time=end_time, limit=limit, now_ms=now_ms
             )
@@ -131,7 +143,7 @@ class KlineService:
                 )
 
                 for gap_start, gap_end in plan.historical_gaps:
-                    await self._fill_gap(key, gap_start, gap_end, interval_ms)
+                    await self._fill_gap(key, gap_start, gap_end, interval_ms, now_ms)
 
                 read_start, read_end = plan.cache_read_range
                 historical = (
@@ -152,11 +164,29 @@ class KlineService:
 
         return await self.coalescer.coalesce(coalesce_key, do_work)
 
-    async def _fill_gap(self, key: SeriesKey, start: int, end: int, interval_ms: int) -> None:
+    async def _fill_gap(
+        self, key: SeriesKey, start: int, end: int, interval_ms: int, now_ms: int
+    ) -> None:
+        # Defense in depth, matching _fetch_live_tail/_fetch_passthrough:
+        # never persist or cover a candle that isn't actually closed yet.
+        # In normal operation every row here should already be closed —
+        # plan_fetch bounds gaps to end at closed_boundary — so this only
+        # bites if closed_boundary was ever computed wrong for some reason
+        # this code doesn't yet know about; it must fail safe (re-check
+        # later) rather than mis-cache a live candle.
         rows = await self._call_binance(key, start, end)
-        if rows:
-            await asyncio.to_thread(self.store.upsert_klines, key, rows)
-        await asyncio.to_thread(self.store.add_coverage, key, (start, end))
+        closed = [r for r in rows if r.close_time < now_ms]
+        if closed:
+            await asyncio.to_thread(self.store.upsert_klines, key, closed)
+        if len(closed) == len(rows):
+            # Every returned row is verified closed — including the
+            # legitimately-empty case (rows == []) — so the whole requested
+            # gap, not just the rows within it, is now verified.
+            await asyncio.to_thread(self.store.add_coverage, key, (start, end))
+        elif closed:
+            await asyncio.to_thread(
+                self.store.add_coverage, key, (start, closed[-1].close_time + 1)
+            )
 
     async def _fetch_live_tail(
         self, key: SeriesKey, live_range: Range, now_ms: int
@@ -208,18 +238,25 @@ class KlineService:
         coalesce_key = (key, start_time, end_time, limit, "passthrough")
 
         async def do_work() -> list[list[int | str]]:
-            raw_rows = await self.clients[key.market].fetch_klines(params)
-            rows = [Kline.from_binance_row(row) for row in raw_rows]
+            # Share series_lock with the range path: without it, a
+            # passthrough fetch and a concurrent range-path gap-fill for the
+            # same series can both call KlineStore.add_coverage at once,
+            # racing its non-atomic read-merge-write and silently losing
+            # one of the two coverage ranges (confirmed via direct
+            # reproduction against KlineStore).
+            async with self.coalescer.series_lock(key):
+                raw_rows = await self.clients[key.market].fetch_klines(params)
+                rows = [Kline.from_binance_row(row) for row in raw_rows]
 
-            if key.interval != "1M":
-                closed = [r for r in rows if r.close_time < now_ms]
-                if closed:
-                    await asyncio.to_thread(self.store.upsert_klines, key, closed)
-                    await asyncio.to_thread(
-                        self.store.add_coverage,
-                        key,
-                        (closed[0].open_time, closed[-1].close_time + 1),
-                    )
+                if key.interval != "1M":
+                    closed = [r for r in rows if r.close_time < now_ms]
+                    if closed:
+                        await asyncio.to_thread(self.store.upsert_klines, key, closed)
+                        await asyncio.to_thread(
+                            self.store.add_coverage,
+                            key,
+                            (closed[0].open_time, closed[-1].close_time + 1),
+                        )
 
             return [r.to_binance_row() for r in rows]
 
