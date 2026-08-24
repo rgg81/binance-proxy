@@ -77,6 +77,23 @@ class TestPlanFetch:
         assert plan.cache_read_range == (1_000_000_000, closed_boundary)
         assert plan.historical_gaps == [(1_000_000_000, closed_boundary)]
 
+    def test_start_time_in_the_future_does_not_fetch_the_current_candle(self):
+        # Real Binance returns [] for a startTime beyond "now" — it must
+        # never be answered with the currently-forming candle instead.
+        now = 1_000_000_030_000
+        future_start = 1_000_000_100_000  # well past closed_boundary (1_000_000_020_000)
+        plan = plan_fetch(
+            start=future_start,
+            end=None,
+            limit=5,
+            interval_ms=INTERVAL_MS,
+            coverage=[],
+            now_ms=now,
+        )
+        assert plan.needs_live_tail is True
+        assert plan.live_tail_range == (future_start, future_start + 5 * INTERVAL_MS)
+        assert plan.historical_gaps == []
+
     def test_range_entirely_within_the_open_candle_has_no_historical_part(self):
         now = 1_000_000_030_000
         closed_boundary = 1_000_000_020_000
@@ -92,4 +109,6 @@ class TestPlanFetch:
         assert plan.needs_live_tail is True
         assert plan.cache_read_range == (1_000_000_025_000, closed_boundary)
         assert plan.historical_gaps == []
-        assert plan.live_tail_range == (closed_boundary, 1_000_000_025_000 + INTERVAL_MS)
+        # live_tail_range starts at `start` itself (not closed_boundary),
+        # since start already falls after closed_boundary here.
+        assert plan.live_tail_range == (1_000_000_025_000, 1_000_000_025_000 + INTERVAL_MS)

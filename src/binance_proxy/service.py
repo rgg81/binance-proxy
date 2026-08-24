@@ -48,6 +48,12 @@ def plan_fetch(
     Only called for requests that have an explicit `start` — open-ended
     "tail" requests (no startTime) always take the live passthrough path
     and never call this function.
+
+    `end` is a half-open exclusive boundary (matching the coverage/SQLite
+    convention throughout this codebase) — it is NOT Binance's raw
+    `endTime`, which is inclusive. Callers translating an inbound HTTP
+    request must convert (`end_time + 1`) before calling this function; see
+    the one call site in `KlineService.get_klines`.
     """
     theoretical_end = start + limit * interval_ms
     effective_end = min(end, theoretical_end) if end is not None else theoretical_end
@@ -57,7 +63,11 @@ def plan_fetch(
 
     historical_gaps = subtract_ranges((start, historical_end), coverage)
     needs_live_tail = effective_end > closed_boundary
-    live_tail_range = (closed_boundary, effective_end) if needs_live_tail else None
+    # max(start, closed_boundary): a request whose `start` is itself in the
+    # future (beyond closed_boundary) must ask Binance starting from that
+    # future point — not from "now" — otherwise Binance's own "no candles
+    # exist yet" answer gets replaced by whatever candle is currently open.
+    live_tail_range = (max(start, closed_boundary), effective_end) if needs_live_tail else None
 
     return FetchPlan(
         historical_gaps=historical_gaps,
@@ -99,12 +109,21 @@ class KlineService:
         interval_ms = interval_to_ms(key.interval)
         coalesce_key = (key, start_time, end_time, limit, "range")
 
+        # Binance's `endTime` is inclusive (confirmed against the live API: a
+        # candle whose open_time == endTime IS returned). plan_fetch's `end`
+        # is a half-open exclusive boundary, matching the coverage/SQLite
+        # convention everywhere else. Convert once, here, at the one seam
+        # where a client-supplied (Binance-semantics) value enters our
+        # internal (half-open) arithmetic — do not pass end_time to
+        # plan_fetch un-converted.
+        internal_end = end_time + 1 if end_time is not None else None
+
         async def do_work() -> list[list[int | str]]:
             async with self.coalescer.series_lock(key):
                 coverage = await asyncio.to_thread(self.store.get_coverage, key)
                 plan = plan_fetch(
                     start=start_time,
-                    end=end_time,
+                    end=internal_end,
                     limit=limit,
                     interval_ms=interval_ms,
                     coverage=coverage,

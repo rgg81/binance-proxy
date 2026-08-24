@@ -111,6 +111,46 @@ class TestSingleFlightCoalescing:
         assert all(r == results[0] for r in results)
 
 
+class TestEndTimeIsInclusiveLikeBinance:
+    """Binance's `endTime` query param is inclusive: a candle whose open_time
+    equals `endTime` exactly IS included in the response. Confirmed live
+    against the real API. The internal cache/gap-fill arithmetic is
+    half-open [start, end), so the client's raw (inclusive) end_time must be
+    converted once at the service boundary — this regression-tests that
+    conversion rather than the pure half-open arithmetic itself (which is
+    already covered by test_fetch_plan.py under its own, correct contract).
+    """
+
+    async def test_candle_landing_exactly_on_end_time_is_included(self, respx_mock, tmp_path):
+        service, _store = make_service(tmp_path)
+        # Candles at 0 and 60_000; end_time == 60_000 exactly (candle-aligned).
+        respx_mock.get(KLINES_URL).mock(
+            return_value=httpx.Response(200, json=[binance_row(0), binance_row(60_000)])
+        )
+
+        result = await service.get_klines(
+            KEY, start_time=0, end_time=60_000, limit=10, now_ms=10_000_000
+        )
+
+        assert [row[0] for row in result] == [0, 60_000]
+
+    async def test_cached_range_still_includes_the_end_time_aligned_candle(
+        self, respx_mock, tmp_path
+    ):
+        service, store = make_service(tmp_path)
+        rows = [Kline.from_binance_row(binance_row(t)) for t in (0, 60_000)]
+        store.upsert_klines(KEY, rows)
+        store.add_coverage(KEY, (0, 120_000))  # half-open, correctly covers both
+        route = respx_mock.get(KLINES_URL).mock(return_value=httpx.Response(200, json=[]))
+
+        result = await service.get_klines(
+            KEY, start_time=0, end_time=60_000, limit=10, now_ms=10_000_000
+        )
+
+        assert route.call_count == 0
+        assert [row[0] for row in result] == [0, 60_000]
+
+
 class TestLiveTail:
     async def test_open_candle_is_returned_but_never_persisted(self, respx_mock, tmp_path):
         service, store = make_service(tmp_path)
