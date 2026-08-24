@@ -209,6 +209,52 @@ def check_cache_hit(client: httpx.Client) -> CheckResult:
     )
 
 
+def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> CheckResult:
+    """The check above (`check_cache_hit`) only proves the cache-served
+    response is *self-consistent* (identical to what the proxy itself
+    returned the first time) — it never compares against real Binance. Every
+    other fidelity check below always hits a never-before-queried window
+    (since `now` shifts every run), so they only ever exercise the fresh
+    Binance-passthrough path, never the SQLite round-trip. Neither on its
+    own proves what actually comes out of the cache is correct — a bug in
+    Kline (de)serialization, or in how a cached read is reconstructed into
+    Binance's array shape, could reproduce itself identically on every read
+    and still pass both of those. This check closes that gap directly: it
+    forces a cache-served response (confirmed via the same upstream-call-
+    delta proof as check_cache_hit) and compares THAT, specifically,
+    against an independent real Binance call for the same window.
+    """
+    now = _now_ms()
+    start, end = now - 9_000_000, now - 8_600_000  # a window this check owns exclusively
+    params: dict[str, str | int] = {
+        "symbol": "DOTUSDT",
+        "interval": "1m",
+        "startTime": start,
+        "endTime": end,
+    }
+
+    try:
+        client.get("/api/v3/klines", params=params, timeout=15)  # warm the cache
+        before = _spot_upstream_calls(client)
+        cached_resp = client.get("/api/v3/klines", params=params, timeout=15).json()
+        after = _spot_upstream_calls(client)
+        real_resp = real.get(
+            f"{REAL_SPOT_BASE}/api/v3/klines", params=params, timeout=15
+        ).json()
+    except httpx.HTTPError as exc:
+        return CheckResult("cache_served_fidelity", False, f"request failed: {exc}")
+
+    was_cache_served = after == before
+    matches_real = cached_resp == real_resp
+    ok = was_cache_served and matches_real
+    return CheckResult(
+        "cache_served_fidelity",
+        ok,
+        f"was_cache_served={was_cache_served} matches_real_binance={matches_real}"
+        + ("" if matches_real else f" MISMATCH: cached={cached_resp!r} real={real_resp!r}"),
+    )
+
+
 def check_coalescing(client: httpx.Client, n: int = 15) -> CheckResult:
     """N concurrent identical requests on a fresh window must collapse to
     exactly one upstream call, with every response identical."""
@@ -317,6 +363,7 @@ def run_all(proxy_url: str, skip_code_quality: bool, db_path: Path) -> list[Chec
             results.append(check_end_time_inclusive(client, real))
             results.append(check_future_start_time_empty(client))
             results.append(check_cache_hit(client))
+            results.append(check_cache_served_fidelity(client, real))
             results.append(check_coalescing(client))
 
         results.append(check_cache_integrity(db_path))

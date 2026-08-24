@@ -45,14 +45,25 @@ the same way you would for any bug report on this project. Before deciding
 something is broken:
 
 1. Read the failing check's `detail` in the printed output / report JSON.
-2. For a `fidelity_*` or `end_time_inclusive` or `future_start_time_empty`
-   failure: these compare directly against a live Binance call, so a
-   mismatch is a strong signal of a real regression — re-run the specific
-   comparison once to rule out a transient network blip, then treat it as
-   real if it persists. These three checks map directly to bugs that were
-   real and confirmed in this project before; see
-   `docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md` and
-   `CLAUDE.md`'s invariants for the history.
+2. For a `fidelity_*`, `end_time_inclusive`, `future_start_time_empty`, or
+   `cache_served_fidelity` failure: these compare directly against a live
+   Binance call, so a mismatch is a strong signal of a real regression —
+   re-run the specific comparison once to rule out a transient network
+   blip, then treat it as real if it persists. The first three map
+   directly to bugs that were real and confirmed in this project before;
+   see `docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md`
+   and `CLAUDE.md`'s invariants for the history. `cache_served_fidelity` is
+   the most structurally important of the four: every other fidelity check
+   always queries a never-before-seen time window (since "now" shifts every
+   6-hour run), so they only ever exercise a fresh Binance-passthrough
+   response — never data actually read back out of the SQLite cache. A bug
+   in how a cached row is stored or reconstructed (see `models.py`'s
+   `Kline.from_binance_row`/`to_binance_row`) could reproduce itself
+   identically on every read and still pass all of those. This check
+   forces a cache-served response (proven via the same zero-upstream-call
+   signal as `check_cache_hit`) and compares *that specifically* against
+   real Binance — it's the one check that actually verifies the proxy's
+   core reason for existing: the cache round-trip preserves the truth.
 3. For a `cache_hit` or `coalescing` failure: check `/stats` on the running
    proxy and consider whether the query shape used by real traffic could
    explain it before assuming a bug. **Known false alarm, already
