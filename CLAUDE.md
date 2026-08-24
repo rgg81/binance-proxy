@@ -151,6 +151,23 @@ is actually verified. Keep new behavior covered the same way: pure-logic
 unit test first if the logic can be isolated, integration test for the
 wiring.
 
+## Production monitoring
+
+`scripts/monitor.py` + the `monitor-binance-proxy` skill
+(`.claude/skills/monitor-binance-proxy/`) run a complete correctness check
+against a live instance — see the skill file for what each check verifies
+and how to interpret a failure. It's scheduled via a local cron entry
+(`scripts/run_monitor_skill.sh`, every 6 hours, invoking `claude -p`
+headlessly) — **not** the cloud `schedule` skill, which runs in an isolated
+environment with no access to a `127.0.0.1`-only proxy, the local venv, or
+the SQLite file. This proxy also has a separate, pre-existing uptime-only
+watchdog (`crypto-trade-claude-code-market-neutral-v4/scripts/
+binance_proxy.sh`, `*/5 * * * *` + `@reboot`) that restarts the process if
+it's down — the monitor skill is a complementary correctness layer on top
+of that, not a replacement for it, and deliberately never restarts the
+process or modifies code itself (detect-and-alert only; see the skill's
+Scope section).
+
 ## Known limitations (by design, not oversights)
 
 - **Coalescer cancellation propagation**: if the task running the shared

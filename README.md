@@ -146,6 +146,31 @@ All configuration is via environment variables (or a `.env` file — see
   production — it reports, per market, how many requests actually reached
   Binance (`upstream_calls_made`) versus how many were coalesced
   (`coalescing.calls_joined`), plus current weight usage and breaker state.
+- **A low overall cache-hit ratio in `/stats` doesn't necessarily mean
+  caching is broken.** A request shape like a large `limit` (e.g. 1000)
+  combined with a `startTime` near "now" always needs to re-verify against
+  Binance on every call, by construction — its implied window extends far
+  past the closed-candle boundary regardless of caching. Run
+  `scripts/monitor.py` (see below) for a check that isolates real cache
+  failures from this expected pattern.
+
+### Correctness monitoring
+
+`scripts/monitor.py` runs a complete correctness/health check against a
+live instance: code quality (pytest/ruff/mypy), response fidelity vs. the
+real Binance API, cache-hit and coalescing effectiveness, and cache
+integrity read directly from disk. Run it directly:
+
+```bash
+.venv/bin/python scripts/monitor.py
+```
+
+It's also wrapped by the `monitor-binance-proxy` Claude Code skill
+(`.claude/skills/monitor-binance-proxy/`), which interprets results,
+distinguishes real problems from explainable traffic patterns, and sends a
+push notification only for genuine failures — detect-and-alert only, no
+auto-remediation. A cron entry (`scripts/run_monitor_skill.sh`, every 6
+hours) runs it unattended.
 
 ## Development
 

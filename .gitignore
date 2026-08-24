@@ -15,3 +15,6 @@ data/
 *.db-shm
 .coverage
 htmlcov/
+monitoring/reports/
+monitoring/cron-logs/
+logs/
