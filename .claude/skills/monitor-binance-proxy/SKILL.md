@@ -55,15 +55,24 @@ first, the same way you would for any bug report on this project.
    doesn't corrupt what it stores — it forces a cache-served response
    (proven via a zero-upstream-call signal) and compares that against real
    Binance, not just against the proxy's own earlier response.
-3. For a `coalescing` failure: `N` concurrent identical requests should
+3. For a `malformed_input_does_not_crash` failure: Binance is the sole
+   source of truth for request validity here (CLAUDE.md invariant #5) —
+   the proxy does no local validation, so a bad param must still relay
+   Binance's own error response, never crash with a raw 500. This is a
+   regression check for a real, previously-fixed bug: a malformed `limit`
+   once crashed the proxy before the request ever reached Binance
+   (invariant #6). A failure here is a real regression, not a flaky
+   network signal — treat it as such immediately.
+4. For a `coalescing` failure: `N` concurrent identical requests should
    collapse to at most one upstream call. A failure here means the
    single-flight mechanism — the direct fix for "many desks call the same
    thing in parallel" — isn't working, which is the core reason this
    proxy exists.
-4. For `code_quality` (pytest/ruff/mypy) failures: this means the
-   *deployed code itself* regressed — read the actual failing test/lint/
-   type output (full output is in the report JSON if the printed tail
-   isn't enough) and treat it like any other broken test in this repo.
+5. For a `pytest`, `ruff`, or `mypy` failure (three separately-named
+   results, not one combined check): this means the *deployed code
+   itself* regressed — read the actual failing test/lint/type output
+   (full output is in the report JSON if the printed tail isn't enough)
+   and treat it like any other broken test in this repo.
 
 Once you've determined it's a real problem, send a push notification with
 a concise, specific summary — this is exactly the kind of thing worth

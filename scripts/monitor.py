@@ -16,14 +16,18 @@ What this checks (see .claude/skills/monitor-binance-proxy/SKILL.md for the
 TTL cache keyed by exact request signature, no persistence, no history — so
 these checks are simpler too:
   1. The proxy process is up and /healthz responds.
-  2. The deployed code is still correct: full pytest + ruff + mypy.
+  2. The deployed code is still correct: full pytest + ruff + mypy (three
+     separately-named results: "pytest", "ruff", "mypy").
   3. Response fidelity vs. the real Binance API (spot + futures) — the
      proxy forwards params verbatim and must relay Binance's answer
      unchanged.
   4. A repeated identical request within the TTL is served from cache
      (zero new upstream calls) and matches real Binance — proves the cache
      round-trip doesn't corrupt anything, not just that it's self-consistent.
-  5. Concurrent identical requests collapse to one upstream call.
+  5. A malformed query param (e.g. a non-numeric `limit`) must still reach
+     Binance, not crash the proxy with a raw 500 — regression check for a
+     real, previously-fixed bug (CLAUDE.md invariant #6).
+  6. Concurrent identical requests collapse to one upstream call.
 """
 
 from __future__ import annotations
@@ -172,7 +176,33 @@ def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> Che
     )
 
 
-# -- 5. coalescing effectiveness ---------------------------------------------
+# -- 5. malformed input must never crash the proxy ---------------------------
+
+
+def check_malformed_input_does_not_crash(client: httpx.Client) -> CheckResult:
+    """Regression check for a real, previously-fixed bug (CLAUDE.md
+    invariant #6): a malformed `limit` query param crashed the proxy with a
+    raw 500 instead of ever reaching Binance, which is the source of truth
+    for request validity here — the proxy does no local validation of its
+    own. A healthy proxy relays whatever Binance says (almost certainly a
+    400) rather than crashing before the call is even made.
+    """
+    try:
+        r = client.get(
+            "/api/v3/klines",
+            params={"symbol": "BTCUSDT", "interval": "1m", "limit": "not-a-number"},
+            timeout=15,
+        )
+    except httpx.HTTPError as exc:
+        return CheckResult("malformed_input_does_not_crash", False, f"request failed: {exc}")
+
+    ok = r.status_code != 500
+    return CheckResult(
+        "malformed_input_does_not_crash", ok, f"status={r.status_code} body={r.text[:200]}"
+    )
+
+
+# -- 6. coalescing effectiveness ---------------------------------------------
 
 
 def check_coalescing(client: httpx.Client, n: int = 15) -> CheckResult:
@@ -229,6 +259,7 @@ def run_all(proxy_url: str, skip_code_quality: bool) -> list[CheckResult]:
             results.append(check_response_fidelity(client, real, "BTCUSDT", "spot"))
             results.append(check_response_fidelity(client, real, "BTCUSDT", "usdm_futures"))
             results.append(check_cache_served_fidelity(client, real))
+            results.append(check_malformed_input_does_not_crash(client))
             results.append(check_coalescing(client))
 
     return results
