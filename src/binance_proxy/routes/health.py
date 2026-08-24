@@ -1,7 +1,8 @@
 """GET /healthz (liveness) and GET /stats (operational visibility).
 
-/stats is how you confirm the anti-rate-limit mechanism is actually working
-in production: coalescing hit rate and per-market breaker/weight state.
+/stats is how you confirm the cache is actually working in production:
+cache hit/miss counts, coalescing counts, and per-market breaker/weight
+state.
 """
 
 from __future__ import annotations
@@ -25,16 +26,17 @@ async def stats(request: Request) -> dict[str, Any]:
     clients = service.clients
 
     return {
+        "cache": {
+            "entries": len(service.cache),
+            "hits": service.cache.hits,
+            "misses": service.cache.misses,
+        },
         "coalescing": {
-            # How many requests had to do their own work vs. rode along on
-            # an already-in-flight identical request (Layer A single-flight).
             "calls_started": service.coalescer.calls_started,
             "calls_joined": service.coalescer.calls_joined,
         },
         "markets": {
             market.value: {
-                # The direct answer to "is caching actually reducing calls
-                # to Binance?" — compare this to total proxy requests served.
                 "upstream_calls_made": clients[market].calls_made,
                 "used_weight": limiters[market].used_weight(),
                 "banned": limiters[market].is_banned(),

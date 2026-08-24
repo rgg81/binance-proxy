@@ -1,6 +1,6 @@
-"""Unit tests for Coalescer: exact-request single-flight (Layer A) and
-per-series locking (Layer B). These are the mechanisms that directly satisfy
-"only one request reaches Binance when many identical ones arrive at once".
+"""Unit tests for Coalescer: exact-request single-flight. This is the
+mechanism that directly satisfies "only one request reaches Binance when
+many identical ones arrive at once".
 """
 
 import asyncio
@@ -112,31 +112,3 @@ class TestCoalescingStats:
 
         assert coalescer.calls_started == 1
         assert coalescer.calls_joined == 1
-
-
-class TestPerSeriesLock:
-    async def test_same_series_key_returns_the_same_lock(self):
-        coalescer = Coalescer()
-        assert coalescer.series_lock("BTCUSDT:1m") is coalescer.series_lock("BTCUSDT:1m")
-
-    async def test_different_series_keys_return_different_locks(self):
-        coalescer = Coalescer()
-        assert coalescer.series_lock("BTCUSDT:1m") is not coalescer.series_lock("ETHUSDT:1m")
-
-    async def test_lock_actually_serializes_critical_sections(self):
-        coalescer = Coalescer()
-        order = []
-
-        async def critical_section(name, hold_seconds):
-            async with coalescer.series_lock("series"):
-                order.append(f"{name}-start")
-                await asyncio.sleep(hold_seconds)
-                order.append(f"{name}-end")
-
-        await asyncio.gather(
-            critical_section("first", 0.02),
-            critical_section("second", 0.0),
-        )
-        # "second" must wait for "first" to fully release the lock before
-        # starting, even though it has nothing to await itself.
-        assert order == ["first-start", "first-end", "second-start", "second-end"]

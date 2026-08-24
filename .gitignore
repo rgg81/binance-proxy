@@ -9,10 +9,6 @@ dist/
 .mypy_cache/
 .ruff_cache/
 .env
-data/
-*.db
-*.db-wal
-*.db-shm
 .coverage
 htmlcov/
 monitoring/reports/

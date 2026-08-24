@@ -1,13 +1,11 @@
 """Concurrency control that turns a stampede of duplicate requests into one.
 
-Two layers, used together by the service layer:
-
-- Layer A (`coalesce`): exact-request single-flight. Concurrent callers using
-  the identical key share one execution of `work` and its result/exception.
-  This is the direct fix for "N desks fire the same request at once".
-- Layer B (`series_lock`): a per-series `asyncio.Lock`, used to serialize the
-  gap-fill critical section even for *overlapping-but-not-identical*
-  requests on the same (market, symbol, interval, timezone) series.
+Exact-request single-flight: concurrent callers using the identical key
+share one execution of `work` and its result/exception. This is the direct
+fix for "N desks fire the same request at once" — combined with the TTL
+cache (`cache.py`), a request either finds a fresh cached response or joins
+whichever single in-flight fetch is already resolving it; two different
+callers never independently fetch the same thing at the same time.
 
 Known limitation: if the task currently running `work()` for a key is
 cancelled (e.g. the initiating client disconnects), that cancellation
@@ -31,7 +29,6 @@ class Coalescer:
         # produces; Any here (not T) because one Coalescer instance is
         # shared across calls with different result types.
         self._inflight: dict[Hashable, asyncio.Future[Any]] = {}
-        self._series_locks: dict[Hashable, asyncio.Lock] = {}
         # Observability only (exposed via /stats): how often a caller had to
         # do the work itself vs. got to ride along on an in-flight call.
         self.calls_started = 0
@@ -57,10 +54,3 @@ class Coalescer:
             del self._inflight[key]
 
         return await future
-
-    def series_lock(self, series_key: Hashable) -> asyncio.Lock:
-        lock = self._series_locks.get(series_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._series_locks[series_key] = lock
-        return lock

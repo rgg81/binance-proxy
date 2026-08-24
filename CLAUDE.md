@@ -4,11 +4,13 @@ Guidance for Claude Code (or any future contributor) working in this repo.
 
 ## What this is
 
-A caching reverse proxy for Binance's public klines REST API. Full design
-rationale: `docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md`.
-Read it before changing anything in `service.py`, `cache/`, or
-`upstream/rate_limiter.py` — those modules implement a specific, carefully
-reasoned-through algorithm, not an obvious one.
+A minimal caching reverse proxy for Binance's public klines REST API. Its
+only job is to avoid the calling IP getting 418-banned by Binance —
+nothing more. Full design rationale, including why this replaced an
+earlier, much more elaborate SQLite-backed historical cache:
+`docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md` (and,
+for archaeology, the original design at
+`docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md`).
 
 ## Commands
 
@@ -17,7 +19,7 @@ source .venv/bin/activate    # venv already created at ./.venv
 
 pytest                        # full suite
 pytest tests/unit             # pure-logic tests only, no network
-pytest tests/integration       # respx-mocked Binance + real SQLite
+pytest tests/integration       # respx-mocked Binance
 
 ruff check .                    # lint
 mypy                              # strict type check — must stay clean
@@ -25,131 +27,107 @@ mypy                              # strict type check — must stay clean
 uvicorn binance_proxy.app:app --reload   # run locally
 ```
 
-All four (pytest, ruff, mypy, and a manual smoke test against the real
-Binance API) passed clean as of the initial implementation. Keep them that
-way — this is a small, deliberately over-engineered-for-correctness
-codebase; regressions here mean real Binance bans in production.
+## The whole mechanism, in one paragraph
 
-## Invariants — do not break these without re-reading the design doc
+A request's cache key is `(market, path, sorted(query_params))` — the
+*exact* request, nothing normalized or parsed. A hit within
+`CACHE_TTL_SECONDS` (default 60s) is served from memory, zero Binance
+calls. A miss goes through `Coalescer.coalesce()`: if an identical request
+is already in flight, this caller awaits that result instead of starting
+its own fetch. Only the caller that actually starts the fetch talks to
+Binance, through `RateLimiter`/`UpstreamClient` (weight throttle +
+circuit breaker, unchanged from the original design). A successful (200)
+response gets cached; anything else does not. That's the entire system —
+`service.py` is ~40 lines.
 
-1. **The currently-forming candle is never persisted or counted as
-   covered.** `plan_fetch` in `service.py` computes `closed_boundary =
-   (now_ms // interval_ms) * interval_ms` and never lets cache coverage
-   extend past it. If you touch gap-fill logic, re-run
-   `tests/integration/test_service.py::TestLiveTail` and make sure it still
-   asserts zero persisted rows for the open candle. Relatedly,
-   `live_tail_range`'s start is `max(start, closed_boundary)`, not
-   `closed_boundary` alone — a request whose own `start` is already past
-   `closed_boundary` (including a genuinely future `startTime`) must fetch
-   from its own `start`, or the proxy fabricates the live candle in place
-   of the empty result Binance itself returns for a future range. This was
-   a real, confirmed bug (verified live: proxy returned a fake current
-   candle for a future startTime before the fix, `[]` after).
-2. **`timezone` is part of a series' identity**, not an afterthought —
-   Binance's `timeZone` param shifts candle boundaries for intervals ≥ 1d.
-   `SeriesKey` includes it; don't collapse it out for convenience. Further:
-   **any non-`"0"` timezone bypasses the coverage-READ/gap-fill path
-   entirely** (`KlineService.get_klines`'s dispatch condition) — the
-   `closed_boundary` math is UTC-only and cannot be trusted to shift
-   correctly for other offsets. This was a real, confirmed bug (a
-   still-forming shifted daily candle got permanently mis-cached); see
-   `TestNonUtcTimezoneBypassesTheCache` for the numeric reproduction. The
-   bypass only disables the boundary-based *read*; passthrough may still
-   safely cache a row via its own `close_time` from Binance, which is
-   ground truth regardless of timezone.
-3. **This proxy is single-process by design.** Coalescing (`coalescing.py`)
-   and rate limiting (`upstream/rate_limiter.py`) hold in-memory state with
-   no cross-process coordination. Do not add `uvicorn --workers N` or run
-   multiple instances behind a load balancer without redesigning both — see
-   the design doc's "Deployment model" discussion for why this was a
-   deliberate choice, not an oversight.
-4. **A single gap is always ≤ 1000 candles wide**, by construction (`plan_fetch`
-   bounds the window to `start + limit * interval_ms`, and `limit` is capped
-   at 1000 — the same cap Binance itself applies). `_call_binance` in
-   `service.py` relies on this to make exactly one Binance call per gap with
-   no pagination. If you ever let a gap exceed 1000 candles, you'll silently
-   under-fetch and create a phantom coverage gap.
-5. **`RateLimiter.on_response`'s header reconciliation only ever increases**
-   the tracked used-weight (`max(self._used_weight, header_weight)`), never
-   decreases it. This is deliberate — a stale/lower header must never make
-   the proxy think it has more headroom than it actually does.
-6. **The `1M` interval is intentionally excluded from the coverage cache**
-   (`interval_to_ms` raises `ValueError` for it; `KlineService.get_klines`
-   checks for it and routes to `_fetch_passthrough`). Don't try to "fix"
-   this by approximating a month's duration — that reintroduces silent
-   incorrectness at month/DST boundaries. If real demand for cached `1M`
-   data appears, it needs its own calendar-aware coverage representation,
-   not a fudge factor on the existing one.
-7. **Binance's `endTime` is inclusive** (open_time ≤ endTime), confirmed
-   live against the real API. `plan_fetch`'s `end` is a half-open exclusive
-   boundary; `KlineService.get_klines` converts once (`end_time + 1`) at
-   the seam where a client's raw endTime enters the internal arithmetic.
-   Do not pass a client's raw `end_time` into `plan_fetch` un-converted —
-   this was a real, confirmed bug (silently dropped the last candle of any
-   candle-aligned range query).
-8. **Every code path that writes to `coverage` for a series must hold
-   `coalescer.series_lock(key)` for the duration of the write** —
-   `KlineStore.add_coverage` is a non-atomic read-merge-write and two
-   concurrent unlocked callers can lose one of their ranges (confirmed by
-   direct reproduction). This includes `_fetch_passthrough`, not just the
-   range path — it was a real, confirmed bug that it didn't.
-9. **`_fill_gap` must never trust the requested `[start, end)` shape** —
-   it derives what to persist/cover from which returned rows are actually
-   closed (`close_time < now_ms`), the same way `_fetch_live_tail` and
-   `_fetch_passthrough` do. This is deliberate defense-in-depth against
-   any future way `closed_boundary` might be computed wrong, not just the
-   timezone case invariant #2 already closes off.
+## Invariants — do not break these
+
+1. **The cache key must be the exact request, not a normalized or
+   partially-matched one.** `ProxyService.get()` builds the key from
+   `sorted(params.items())` specifically so param order never matters, but
+   it must never start interpreting *what* the params mean (no parsing
+   `startTime`, no understanding intervals). The moment this cache tries
+   to be clever about overlapping ranges, it has become the old design
+   again — that complexity was deliberately removed.
+2. **Only a 200 response is ever cached.** `ProxyService.get()`'s
+   `do_work()` checks `if status_code == 200` before calling
+   `cache.set(...)`. An error must always be retried on the next call, not
+   stuck being replayed from cache — that's what
+   `TestErrorsAreNeverCached` in `tests/integration/test_service.py`
+   verifies.
+3. **This proxy is single-process by design.** Both the cache
+   (`cache.py::TTLCache`) and coalescing (`coalescing.py::Coalescer`) are
+   plain in-memory state with no cross-process coordination. Do not add
+   `uvicorn --workers N` or run multiple instances behind a load balancer.
+4. **`RateLimiter.on_response`'s header reconciliation only ever
+   increases** the tracked used-weight (`max(self._used_weight,
+   header_weight)`), never decreases it. A stale/lower header must never
+   make the proxy think it has more headroom than it actually does.
+5. **No parameter validation happens locally.** `routes/klines.py` reads
+   `request.query_params` and forwards them verbatim — Binance is the
+   source of truth for what's a valid request. Do not reintroduce
+   klines-specific param parsing/validation; that's exactly the complexity
+   this redesign removed. If Binance's behavior for some param combination
+   ever needs special-casing again, that's a sign the simple design has
+   met its limit — treat it as a new design decision, not a quick patch.
+   This still means "don't crash" — see invariant 6.
+6. **Nothing in the request path may raise an exception the route layer
+   doesn't catch.** `_handle_klines` only handles `RateLimitedError` and
+   `UpstreamUnavailableError`; anything else becomes a raw 500. A
+   malformed `limit` must reach Binance (parsed defensively, see
+   `_parse_limit` in `upstream/client.py`, not `int()`ed directly), and a
+   transport failure or unparseable Binance response must raise
+   `UpstreamUnavailableError`, not propagate a bare `httpx`/`json`
+   exception. This was a real, confirmed bug (found by independent code
+   review, fixed same day): a client sending `limit=abc` crashed the
+   proxy with a 500 before ever reaching Binance, which directly violated
+   invariant 5 above.
+7. **`RateLimiter.acquire()` must never be able to loop forever.** If a
+   single request's `weight` exceeds the entire usable budget — reachable
+   via ordinary env-var configuration (a low `RATE_LIMIT_SAFETY_MARGIN`),
+   not just a contrived setup — no amount of waiting for a window reset
+   ever satisfies `_used_weight + weight <= usable_budget`. This was a
+   real, confirmed bug: the naive retry loop span so tightly (each
+   iteration only awaiting a near-instant fake/real sleep) that it could
+   starve the event loop badly enough to interfere with unrelated
+   timers in the same process, not just hang the one call. The fix
+   (`acquire()` proceeds best-effort when `weight` alone exceeds the
+   usable budget) must be preserved — see
+   `TestAcquireNeverDeadlocksOnAnUnsatisfiableWeight` in
+   `tests/unit/test_rate_limiter.py`, and note its `FakeSleeper` guards
+   against exactly this class of bug with a hard call-count cap rather
+   than a wall-clock timeout, because a wall-clock timeout is not
+   reliably able to interrupt this kind of tight loop.
 
 ## Architecture map
 
 ```
 config.py           Settings (env vars / .env)
-models.py            Market, SeriesKey, Kline (raw-string-preserving row type)
-intervals.py           interval string -> fixed millisecond duration
-cache/
-  coverage.py           pure interval-set arithmetic (merge/subtract) — no I/O
-  store.py                SQLite: klines + coverage tables
-service.py                 plan_fetch (pure) + KlineService (async orchestration)
-coalescing.py                 Coalescer: single-flight (Layer A) + per-series lock (Layer B)
+models.py             Market enum — that's the entire file now
+cache.py                TTLCache: exact-signature-keyed, TTL-expiring, size-capped
+coalescing.py              Coalescer: single-flight only (no more per-series lock —
+                              there's no gap-fill critical section to serialize anymore)
 upstream/
-  rate_limiter.py              weight throttle + circuit breaker per market
-  client.py                      thin httpx wrapper, wired to one RateLimiter
+  rate_limiter.py              weight throttle + circuit breaker per market (unchanged)
+  client.py                      fetch(path, params) -> (status_code, body), raw passthrough
+service.py                         ProxyService.get(): cache check -> coalesce -> fetch -> cache
 routes/
-  klines.py                       GET /api/v3/klines, GET /fapi/v1/klines
-  health.py                         GET /healthz, GET /stats
+  klines.py                          GET /api/v3/klines, GET /fapi/v1/klines — thin forwarding
+  health.py                            GET /healthz, GET /stats
 app.py                                 wires everything together (FastAPI factory)
 ```
 
-Read order for understanding the request path: `service.py` (`plan_fetch`
-then `KlineService.get_klines`) → `coalescing.py` → `upstream/client.py` →
-`cache/store.py`.
-
-## Cache on disk
-
-SQLite file at `${DATA_DIR}/klines.db` (default `./data/klines.db`). To
-inspect:
-
-```bash
-sqlite3 data/klines.db "select market, symbol, interval, count(*) from klines group by 1,2,3;"
-sqlite3 data/klines.db "select * from coverage where symbol = 'BTCUSDT';"
-```
-
-To reset the cache, just delete the file (or the whole `data/` dir) while
-the proxy isn't running — it's fully rebuildable from Binance, by design.
+Read order for understanding the request path: `service.py` (the whole
+thing) → `coalescing.py` → `upstream/client.py`.
 
 ## Testing conventions
 
-TDD throughout (`superpowers:test-driven-development`): every module here
-was built test-first — write the test, watch it fail for the right reason,
-then write the minimal code to pass. `cache/coverage.py`, `service.py`'s
-`plan_fetch`, `upstream/rate_limiter.py`, and `coalescing.py` are pure or
-near-pure logic with exhaustive unit tests and no network; they're the
-correctness core. `tests/integration/` wires the real pieces together
+TDD throughout. `cache.py`, `coalescing.py`, and `upstream/rate_limiter.py`
+are pure or near-pure logic with exhaustive unit tests and no network —
+the correctness core. `tests/integration/` wires the real pieces together
 against a respx-mocked Binance and asserts on call counts, not just
-response shape — that's how the "only one call reaches Binance" guarantee
-is actually verified. Keep new behavior covered the same way: pure-logic
-unit test first if the logic can be isolated, integration test for the
-wiring.
+response shape — that's how "only one call reaches Binance" and "a repeat
+within TTL costs zero calls" are actually verified, not just assumed.
 
 ## Production monitoring
 
@@ -159,27 +137,33 @@ against a live instance — see the skill file for what each check verifies
 and how to interpret a failure. It's scheduled via a local cron entry
 (`scripts/run_monitor_skill.sh`, every 6 hours, invoking `claude -p`
 headlessly) — **not** the cloud `schedule` skill, which runs in an isolated
-environment with no access to a `127.0.0.1`-only proxy, the local venv, or
-the SQLite file. This proxy also has a separate, pre-existing uptime-only
-watchdog (`crypto-trade-claude-code-market-neutral-v4/scripts/
-binance_proxy.sh`, `*/5 * * * *` + `@reboot`) that restarts the process if
-it's down — the monitor skill is a complementary correctness layer on top
-of that, not a replacement for it, and deliberately never restarts the
-process or modifies code itself (detect-and-alert only; see the skill's
-Scope section).
+environment with no access to a `127.0.0.1`-only proxy. This proxy also has
+a separate, pre-existing uptime-only watchdog
+(`crypto-trade-claude-code-market-neutral-v4/scripts/binance_proxy.sh`,
+`*/5 * * * *` + `@reboot`) that restarts the process if it's down — the
+monitor skill is a complementary correctness layer on top of that, not a
+replacement, and deliberately never restarts the process or modifies code
+itself (detect-and-alert only).
 
-## Known limitations (by design, not oversights)
+## History worth knowing before changing anything
 
-- **Coalescer cancellation propagation**: if the task running the shared
-  `work()` for a coalesced key is cancelled (e.g. a client disconnects),
-  that cancellation propagates to every other caller coalesced onto the
-  same key. Documented in `coalescing.py`'s module docstring. Acceptable
-  for this proxy's usage pattern; would need `asyncio.shield`-based
-  supervision to fully decouple if it ever becomes a real problem.
-- **Weight budget defaults are estimates**, not guarantees — see the note
-  in `README.md`'s Configuration section. The real safety mechanism is
-  header reconciliation (invariant #5 above), not the configured budget.
-- **No pre-warming/backfill tooling.** Cache fills purely from live desk
-  traffic. Was explicitly descoped for v1 (see design doc); would be a
-  reasonably small addition (a CLI driving `KlineService.get_klines`
-  directly) if needed later.
+This project originally shipped with a SQLite-persisted cache that tracked
+exact coverage ranges per series and did gap-fill arithmetic to serve
+partial-range requests from a mix of cached and freshly-fetched data. It
+worked, was thoroughly tested (98 tests, multiple rounds of adversarial
+live verification against real Binance, two genuinely confirmed live bugs
+found and fixed), and is preserved at
+`docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md` for
+reference. It was deliberately replaced with the current design after
+analyzing real production traffic and finding that ~74% of requests use a
+large `limit` with a `startTime` near "now" — a shape that structurally
+can never be satisfied from historical cache, no matter how well-built the
+gap-fill logic is, because the requested window always extends past the
+closed-candle boundary. The historical machinery was solving a problem
+most real traffic didn't have, at a real cost in complexity (an entire
+SQLite schema, coverage-interval arithmetic, an open-candle exclusion
+invariant, and two boundary-precision bugs that took real debugging to
+find). **Do not resurrect that design from memory or convenience** — if a
+future need genuinely requires historical range caching again, treat it as
+a fresh, deliberate decision informed by then-current traffic data, not a
+reflex to "add back what used to be there."

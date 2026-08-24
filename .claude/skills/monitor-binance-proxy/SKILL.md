@@ -1,14 +1,17 @@
 ---
 name: monitor-binance-proxy
-description: Run a complete correctness/health check on the running binance-proxy instance — code correctness, response fidelity vs real Binance, cache-hit and coalescing effectiveness, and cache integrity. Use when asked to check on binance-proxy, verify it's healthy, or investigate whether its cache/data is behaving correctly. Also invoked on a recurring schedule.
+description: Run a complete correctness/health check on the running binance-proxy instance — code correctness, response fidelity vs real Binance, cache and coalescing effectiveness. Use when asked to check on binance-proxy, verify it's healthy, or investigate whether its cache is behaving correctly. Also invoked on a recurring schedule.
 ---
 
 # Monitor binance-proxy
 
-binance-proxy is a critical, production dependency for other applications. Its
-entire purpose is to serve **correct** Binance klines data while minimizing
-upstream calls via caching and request coalescing. This skill verifies both
-properties are actually holding, not just that the process is up.
+binance-proxy is a critical, production dependency for other applications.
+Its purpose is simple and deliberately narrow: cache Binance klines
+responses in memory for a short TTL (default 60s) and coalesce concurrent
+identical requests, so multiple callers hitting Binance in parallel don't
+trip a 418 ban. There is no persistence and no historical data — a cache
+miss just means "ask Binance again." This skill verifies that mechanism is
+actually working, not just that the process is up.
 
 ## Running the check
 
@@ -17,16 +20,16 @@ cd /home/roberto/binance-proxy
 .venv/bin/python scripts/monitor.py
 ```
 
-The script is self-contained and does the real work deterministically — see
-its module docstring for exactly what each check does and why. It:
+The script does the real work deterministically — see its module docstring
+for exactly what each check does and why. It:
 
 - Exits `0` if everything passed, `1` if anything failed.
 - Prints a `[PASS]`/`[FAIL]` line per check.
 - Always writes a timestamped JSON report to `monitoring/reports/`, pass or
   fail, so there's a history to look back over.
-- Skips the live/network checks (but still runs cache integrity) if the
-  proxy itself is unreachable — a dead process is its own finding, not a
-  reason to also report every dependent check as failed.
+- Skips the live/network checks if the proxy itself is unreachable — a dead
+  process is its own finding, not a reason to also report every dependent
+  check as failed.
 
 Pass `--skip-code-quality` to skip the pytest/ruff/mypy pass (faster,
 useful if you just want a live-behavior check). Pass `--proxy-url` if the
@@ -40,74 +43,31 @@ for a clean pass — per PushNotification's own guidance, a notification
 nobody needed is worse than no notification. Just let the report file speak
 for the history.
 
-**Something failed:** don't relay the raw failure as-is — investigate first,
-the same way you would for any bug report on this project. Before deciding
-something is broken:
+**Something failed:** don't relay the raw failure as-is — investigate
+first, the same way you would for any bug report on this project.
 
 1. Read the failing check's `detail` in the printed output / report JSON.
-2. For a `fidelity_*`, `end_time_inclusive`, `future_start_time_empty`, or
-   `cache_served_fidelity` failure: these compare directly against a live
-   Binance call, so a mismatch is a strong signal of a real regression —
-   re-run the specific comparison once to rule out a transient network
-   blip, then treat it as real if it persists. The first three map
-   directly to bugs that were real and confirmed in this project before;
-   see `docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md`
-   and `CLAUDE.md`'s invariants for the history. `cache_served_fidelity` is
-   the most structurally important of the four: every other fidelity check
-   always queries a never-before-seen time window (since "now" shifts every
-   6-hour run), so they only ever exercise a fresh Binance-passthrough
-   response — never data actually read back out of the SQLite cache. A bug
-   in how a cached row is stored or reconstructed (see `models.py`'s
-   `Kline.from_binance_row`/`to_binance_row`) could reproduce itself
-   identically on every read and still pass all of those. This check
-   forces a cache-served response (proven via the same zero-upstream-call
-   signal as `check_cache_hit`) and compares *that specifically* against
-   real Binance — it's the one check that actually verifies the proxy's
-   core reason for existing: the cache round-trip preserves the truth.
-3. For a `cache_hit` or `coalescing` failure: check `/stats` on the running
-   proxy and consider whether the query shape used by real traffic could
-   explain it before assuming a bug. **Known false alarm, already
-   investigated once:** a low overall cache-hit ratio in `/stats` does NOT
-   by itself mean caching is broken — if real traffic uses a large `limit`
-   (e.g. 1000) with a `startTime` near "now", that query's implied window
-   always extends past the closed-candle boundary, so it *must* re-verify
-   against Binance on every call, by construction (see `plan_fetch` in
-   `service.py`). This is not a bug. What actually indicates a *real* cache
-   failure is `check_cache_hit`/`check_coalescing` in the script above
-   failing, since those specifically use a firmly historical window that
-   should be immune to this effect.
-4. For `code_quality` (pytest/ruff/mypy) failures: this means the *deployed
-   code itself* regressed — read the actual failing test/lint/type output
-   (full output is in the report JSON if the printed tail isn't enough) and
-   treat it like any other broken test in this repo.
-5. For `cache_integrity` failures: this reads the SQLite file directly and
-   found either a candle cached past its true closed_boundary (a violation
-   of CLAUDE.md invariant #1/#9) or a malformed coverage range. Both are
-   serious — this is the exact class of bug this project has had before.
-6. For a `live_candle` failure: this is `cache_integrity`'s complement —
-   where that one only proves nothing bad is *currently* sitting in the
-   DB, this one actively exercises the live-tail fetch path right now and
-   checks two things: `agrees_with_real=False` means the proxy and a live
-   Binance call disagree on the open candle's identity/opening price (a
-   real correctness problem); `not_persisted=False` means the still-forming
-   candle was found in the cache — the exact failure mode invariant #1
-   exists to prevent. This check was specifically validated (not just
-   trusted) to catch a real instance of the latter: a fabricated row was
-   planted at the open candle's `open_time` on an isolated test instance,
-   and the check correctly failed with `not_persisted=False` while still
-   correctly reporting `agrees_with_real=True` (the live response itself
-   was unaffected, fetched fresh) — see the commit history for the
-   isolated reproduction.
+2. For a `fidelity_*` or `cache_served_fidelity` failure: these compare
+   directly against a live Binance call, so a mismatch is a strong signal
+   of a real regression — re-run the specific comparison once to rule out
+   a transient network blip, then treat it as real if it persists.
+   `cache_served_fidelity` specifically proves the cache round-trip
+   doesn't corrupt what it stores — it forces a cache-served response
+   (proven via a zero-upstream-call signal) and compares that against real
+   Binance, not just against the proxy's own earlier response.
+3. For a `coalescing` failure: `N` concurrent identical requests should
+   collapse to at most one upstream call. A failure here means the
+   single-flight mechanism — the direct fix for "many desks call the same
+   thing in parallel" — isn't working, which is the core reason this
+   proxy exists.
+4. For `code_quality` (pytest/ruff/mypy) failures: this means the
+   *deployed code itself* regressed — read the actual failing test/lint/
+   type output (full output is in the report JSON if the printed tail
+   isn't enough) and treat it like any other broken test in this repo.
 
-Once you've determined whether it's a real problem:
-
-- **Real problem:** send a push notification with a concise, specific
-  summary (what failed, one likely cause if you found one) — this is
-  exactly the kind of thing worth pulling someone's attention for on a
-  system other applications depend on.
-- **False alarm / explained by traffic pattern, not a bug:** do not send a
-  push notification. Note the explanation in your response so there's a
-  record, but a system behaving correctly doesn't need to interrupt anyone.
+Once you've determined it's a real problem, send a push notification with
+a concise, specific summary — this is exactly the kind of thing worth
+pulling someone's attention for on a system other applications depend on.
 
 ## Scope
 

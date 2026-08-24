@@ -1,271 +1,40 @@
-"""Request orchestration: normalize -> coalesce -> gap-fill -> merge -> respond.
+"""Request orchestration: cache check -> coalesce -> fetch -> cache -> respond.
 
-`plan_fetch` is the pure decision core (no I/O, fully unit-tested). The rest
-of this module wires it to the store, upstream client, and coalescing layer.
+Deliberately simple: no historical range logic, no persistence. A cache
+entry is just "the exact response Binance gave us for this exact request,
+less than TTL seconds ago." A cache miss means asking Binance again, same
+as if there were no cache at all — just less often.
 """
 
 from __future__ import annotations
 
-import asyncio
 from dataclasses import dataclass
 
-from binance_proxy.cache.coverage import Range, subtract_ranges
-from binance_proxy.cache.store import KlineStore
+from binance_proxy.cache import TTLCache
 from binance_proxy.coalescing import Coalescer
-from binance_proxy.intervals import interval_to_ms
-from binance_proxy.models import Kline, Market, SeriesKey
+from binance_proxy.models import Market
 from binance_proxy.upstream.client import UpstreamClient
 
 
-@dataclass(frozen=True, slots=True)
-class FetchPlan:
-    # Sub-ranges of the historical (closed-candle) portion of the request
-    # that are missing from the cache and must be fetched from Binance.
-    historical_gaps: list[Range]
-
-    # Whether the request's window reaches into or past the currently-open
-    # candle, requiring a live (always-fetch, never cache-satisfied) call.
-    needs_live_tail: bool
-
-    # The [closed_boundary, effective_end) portion to fetch live, if any.
-    live_tail_range: Range | None
-
-    # The range to read back from the cache once historical_gaps are filled.
-    cache_read_range: Range
-
-
-def plan_fetch(
-    *,
-    start: int,
-    end: int | None,
-    limit: int,
-    interval_ms: int,
-    coverage: list[Range],
-    now_ms: int,
-) -> FetchPlan:
-    """Decide what needs fetching for a range query starting at `start`.
-
-    Only called for requests that have an explicit `start` — open-ended
-    "tail" requests (no startTime) always take the live passthrough path
-    and never call this function.
-
-    `end` is a half-open exclusive boundary (matching the coverage/SQLite
-    convention throughout this codebase) — it is NOT Binance's raw
-    `endTime`, which is inclusive. Callers translating an inbound HTTP
-    request must convert (`end_time + 1`) before calling this function; see
-    the one call site in `KlineService.get_klines`.
-    """
-    theoretical_end = start + limit * interval_ms
-    effective_end = min(end, theoretical_end) if end is not None else theoretical_end
-
-    closed_boundary = (now_ms // interval_ms) * interval_ms
-    historical_end = min(effective_end, closed_boundary)
-
-    historical_gaps = subtract_ranges((start, historical_end), coverage)
-    needs_live_tail = effective_end > closed_boundary
-    # max(start, closed_boundary): a request whose `start` is itself in the
-    # future (beyond closed_boundary) must ask Binance starting from that
-    # future point — not from "now" — otherwise Binance's own "no candles
-    # exist yet" answer gets replaced by whatever candle is currently open.
-    live_tail_range = (max(start, closed_boundary), effective_end) if needs_live_tail else None
-
-    return FetchPlan(
-        historical_gaps=historical_gaps,
-        needs_live_tail=needs_live_tail,
-        live_tail_range=live_tail_range,
-        cache_read_range=(start, historical_end),
-    )
-
-
 @dataclass
-class KlineService:
-    """Orchestrates a klines request: coalesce -> gap-fill -> merge -> respond.
-
-    `clients` maps each supported Market to the UpstreamClient that talks to
-    that market's Binance base URL.
-    """
-
-    store: KlineStore
+class ProxyService:
+    cache: TTLCache
     coalescer: Coalescer
     clients: dict[Market, UpstreamClient]
 
-    async def get_klines(
-        self,
-        key: SeriesKey,
-        *,
-        start_time: int | None,
-        end_time: int | None,
-        limit: int,
-        now_ms: int,
-    ) -> list[list[int | str]]:
-        # Open-ended "tail" requests, the variable-length "1M" interval, and
-        # any non-UTC timeZone all bypass the coverage-READ / gap-fill
-        # machinery (plan_fetch below). closed_boundary assumes UTC-aligned
-        # candle boundaries; a non-"0" timeZone shifts those boundaries for
-        # intervals >= 1d (see SeriesKey's docstring), which this arithmetic
-        # does not — and, given Binance's per-offset boundary rules,
-        # realistically cannot cheaply — account for. Without this bypass a
-        # still-forming shifted candle can be misclassified as historical
-        # and permanently mis-cached; see CLAUDE.md invariant #1.
-        #
-        # This only disables the unsafe boundary-based READ path — the
-        # passthrough fetch below may still opportunistically persist rows
-        # it fetches, safely, using each row's own close_time from Binance
-        # (ground truth, correctly timezone-aware since Binance computed
-        # it) rather than this module's own boundary math.
-        if start_time is None or key.interval == "1M" or key.timezone != "0":
-            return await self._fetch_passthrough(
-                key, start_time=start_time, end_time=end_time, limit=limit, now_ms=now_ms
-            )
+    async def get(
+        self, market: Market, path: str, params: dict[str, str]
+    ) -> tuple[int, object]:
+        key = (market, path, tuple(sorted(params.items())))
 
-        interval_ms = interval_to_ms(key.interval)
-        coalesce_key = (key, start_time, end_time, limit, "range")
+        cached = self.cache.get(key)
+        if cached is not None:
+            return cached.status_code, cached.body
 
-        # Binance's `endTime` is inclusive (confirmed against the live API: a
-        # candle whose open_time == endTime IS returned). plan_fetch's `end`
-        # is a half-open exclusive boundary, matching the coverage/SQLite
-        # convention everywhere else. Convert once, here, at the one seam
-        # where a client-supplied (Binance-semantics) value enters our
-        # internal (half-open) arithmetic — do not pass end_time to
-        # plan_fetch un-converted.
-        internal_end = end_time + 1 if end_time is not None else None
+        async def do_work() -> tuple[int, object]:
+            status_code, body = await self.clients[market].fetch(path, params)
+            if status_code == 200:
+                self.cache.set(key, status_code, body)
+            return status_code, body
 
-        async def do_work() -> list[list[int | str]]:
-            async with self.coalescer.series_lock(key):
-                coverage = await asyncio.to_thread(self.store.get_coverage, key)
-                plan = plan_fetch(
-                    start=start_time,
-                    end=internal_end,
-                    limit=limit,
-                    interval_ms=interval_ms,
-                    coverage=coverage,
-                    now_ms=now_ms,
-                )
-
-                for gap_start, gap_end in plan.historical_gaps:
-                    await self._fill_gap(key, gap_start, gap_end, interval_ms, now_ms)
-
-                read_start, read_end = plan.cache_read_range
-                historical = (
-                    await asyncio.to_thread(self.store.get_klines, key, read_start, read_end)
-                    if read_end > read_start
-                    else []
-                )
-
-                live_rows: list[Kline] = []
-                if plan.needs_live_tail:
-                    assert plan.live_tail_range is not None
-                    live_rows = await self._fetch_live_tail(
-                        key, plan.live_tail_range, now_ms
-                    )
-
-                merged = _merge_by_open_time(historical, live_rows)
-                return [k.to_binance_row() for k in merged[:limit]]
-
-        return await self.coalescer.coalesce(coalesce_key, do_work)
-
-    async def _fill_gap(
-        self, key: SeriesKey, start: int, end: int, interval_ms: int, now_ms: int
-    ) -> None:
-        # Defense in depth, matching _fetch_live_tail/_fetch_passthrough:
-        # never persist or cover a candle that isn't actually closed yet.
-        # In normal operation every row here should already be closed —
-        # plan_fetch bounds gaps to end at closed_boundary — so this only
-        # bites if closed_boundary was ever computed wrong for some reason
-        # this code doesn't yet know about; it must fail safe (re-check
-        # later) rather than mis-cache a live candle.
-        rows = await self._call_binance(key, start, end)
-        closed = [r for r in rows if r.close_time < now_ms]
-        if closed:
-            await asyncio.to_thread(self.store.upsert_klines, key, closed)
-        if len(closed) == len(rows):
-            # Every returned row is verified closed — including the
-            # legitimately-empty case (rows == []) — so the whole requested
-            # gap, not just the rows within it, is now verified.
-            await asyncio.to_thread(self.store.add_coverage, key, (start, end))
-        elif closed:
-            await asyncio.to_thread(
-                self.store.add_coverage, key, (start, closed[-1].close_time + 1)
-            )
-
-    async def _fetch_live_tail(
-        self, key: SeriesKey, live_range: Range, now_ms: int
-    ) -> list[Kline]:
-        start, end = live_range
-        rows = await self._call_binance(key, start, end)
-        closed = [r for r in rows if r.close_time < now_ms]
-        if closed:
-            await asyncio.to_thread(self.store.upsert_klines, key, closed)
-            await asyncio.to_thread(
-                self.store.add_coverage, key, (start, closed[-1].close_time + 1)
-            )
-        return rows
-
-    async def _call_binance(self, key: SeriesKey, start: int, end: int) -> list[Kline]:
-        interval_ms = interval_to_ms(key.interval)
-        count = max(1, min(1000, (end - start + interval_ms - 1) // interval_ms))
-        params = {
-            "symbol": key.symbol,
-            "interval": key.interval,
-            "timeZone": key.timezone,
-            "startTime": start,
-            "endTime": end - 1,
-            "limit": count,
-        }
-        raw_rows = await self.clients[key.market].fetch_klines(params)
-        return [Kline.from_binance_row(row) for row in raw_rows]
-
-    async def _fetch_passthrough(
-        self,
-        key: SeriesKey,
-        *,
-        start_time: int | None,
-        end_time: int | None,
-        limit: int,
-        now_ms: int,
-    ) -> list[list[int | str]]:
-        params = {
-            "symbol": key.symbol,
-            "interval": key.interval,
-            "timeZone": key.timezone,
-            "limit": limit,
-        }
-        if start_time is not None:
-            params["startTime"] = start_time
-        if end_time is not None:
-            params["endTime"] = end_time
-
-        coalesce_key = (key, start_time, end_time, limit, "passthrough")
-
-        async def do_work() -> list[list[int | str]]:
-            # Share series_lock with the range path: without it, a
-            # passthrough fetch and a concurrent range-path gap-fill for the
-            # same series can both call KlineStore.add_coverage at once,
-            # racing its non-atomic read-merge-write and silently losing
-            # one of the two coverage ranges (confirmed via direct
-            # reproduction against KlineStore).
-            async with self.coalescer.series_lock(key):
-                raw_rows = await self.clients[key.market].fetch_klines(params)
-                rows = [Kline.from_binance_row(row) for row in raw_rows]
-
-                if key.interval != "1M":
-                    closed = [r for r in rows if r.close_time < now_ms]
-                    if closed:
-                        await asyncio.to_thread(self.store.upsert_klines, key, closed)
-                        await asyncio.to_thread(
-                            self.store.add_coverage,
-                            key,
-                            (closed[0].open_time, closed[-1].close_time + 1),
-                        )
-
-            return [r.to_binance_row() for r in rows]
-
-        return await self.coalescer.coalesce(coalesce_key, do_work)
-
-
-def _merge_by_open_time(*groups: list[Kline]) -> list[Kline]:
-    by_open_time: dict[int, Kline] = {}
-    for group in groups:
-        for kline in group:
-            by_open_time[kline.open_time] = kline
-    return [by_open_time[t] for t in sorted(by_open_time)]
+        return await self.coalescer.coalesce(key, do_work)

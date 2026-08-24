@@ -2,37 +2,38 @@
 
 A caching reverse proxy for Binance's public **klines** (candlestick) REST
 endpoints. It exposes the exact same request/response signature as Binance
-itself, caches closed candles to disk, and guarantees that when many
-callers ask for the same or overlapping data at the same time, **at most
-one request reaches Binance** — everyone else is served from cache or rides
-along on that one in-flight call.
+itself, and its job is narrow and deliberate: **avoid getting the calling
+IP banned (HTTP 418)** by making sure that when many callers ask for the
+same thing at roughly the same time, Binance only ever gets asked once.
 
 Built for the situation where several independent processes ("desks") each
 talk to Binance directly, don't coordinate with each other, and collectively
 trip Binance's IP-based rate limits. Point them all at this proxy instead —
-same URLs, same JSON — and the rate-limit problem disappears without
-touching the callers' code.
+same URLs, same JSON — and that problem goes away without touching the
+callers' code.
 
-## Why this works
+## How it works
 
-Closed klines candles are **immutable** — a candle that has closed never
-changes. That means:
+There is no database, no persistence, and no history. The entire mechanism
+is:
 
-- Once a range of history has been fetched, it never needs to be fetched
-  again. The disk cache (SQLite) never evicts closed candles.
-- The proxy tracks exactly which time ranges of each `(market, symbol,
-  interval, timezone)` series have already been verified against Binance,
-  and on every request computes the *minimal* missing sub-range — often
-  zero — rather than re-fetching anything already known.
-- Concurrent requests for the same data are collapsed into one upstream
-  call via request coalescing (see [Architecture](#architecture)).
-- A weight-aware throttle and circuit breaker keep the proxy itself from
-  ever tripping Binance's own limits, using Binance's response headers as
-  the source of truth.
+1. **In-memory cache, keyed by the exact request** (path + every query
+   param, verbatim). A repeat of the exact same request within 60 seconds
+   (configurable) is served from memory — zero calls to Binance.
+2. **Single-flight coalescing.** If multiple identical requests arrive
+   while one is already in flight, they all share that one fetch and its
+   result — this is the direct fix for "N desks fire the same request at
+   once."
+3. **Weight-aware rate limiting + circuit breaker**, using Binance's own
+   response headers as ground truth, so the proxy backs off before Binance
+   would reject it, and opens a breaker (serving `503` + `Retry-After`) on
+   an actual `429`/`418` instead of hammering through one.
 
-The only thing that's never cached is the **currently-forming candle** —
-it's still changing, so it's always fetched live (though still coalesced
-and rate-limited).
+That's it. A cache miss just means "ask Binance again" — same as if there
+were no cache at all, just less often. Nothing is parsed, validated, or
+understood about *what* a request is asking for; params are forwarded to
+Binance exactly as received, and Binance's response (success or error) is
+relayed back exactly as received.
 
 ## Quickstart
 
@@ -58,8 +59,6 @@ directly — only the base URL changes:
 curl "http://localhost:8000/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5"
 ```
 
-The response is byte-for-byte what Binance itself would return.
-
 ## Supported endpoints
 
 | Path | Market | Upstream |
@@ -69,39 +68,28 @@ The response is byte-for-byte what Binance itself would return.
 | `GET /healthz` | — | liveness probe |
 | `GET /stats` | — | cache/coalescing/rate-limit visibility |
 
-Query parameters (`symbol`, `interval`, `startTime`, `endTime`, `timeZone`,
-`limit`) match Binance exactly, including its `limit` default (500) and
-bounds (1–1000). Invalid/unknown-symbol errors from Binance are passed
-through with the same status code and JSON body.
-
-This proxy is scoped to **klines only** for v1 — other public market-data
-endpoints (order book, trades, tickers) are out of scope but could be added
-following the same pattern.
+Any query parameter Binance's klines endpoint accepts is forwarded as-is —
+there's no hardcoded list to keep in sync. Invalid-request errors from
+Binance are passed through with the same status code and JSON body, and are
+never cached (so fixing a bad request is immediately reflected, not stuck
+behind a stale cached error).
 
 ## Architecture
 
 ```
 Desk A ─┐
-Desk B ─┼─► Proxy ─► [1] Single-flight dedupe ─► [2] Coverage/gap check ─► SQLite cache
-Desk C ─┘                                              │ (miss/partial)
-                                                        ▼
-                                              [3] Rate limiter + circuit breaker ─► Binance
+Desk B ─┼─► Proxy ─► [1] TTL cache check ─► [2] Single-flight coalesce ─► [3] Rate limiter + breaker ─► Binance
+Desk C ─┘        (hit: zero calls)              (miss: one fetch shared)
 ```
 
-1. **Single-flight coalescing** — identical concurrent requests (same
-   symbol/interval/range/limit) share one execution and one result.
-2. **Coverage-based gap-fill** — a per-series lock serializes fetch
-   planning; only the sub-range genuinely missing from the cache is
-   requested from Binance, never the whole thing.
-3. **Weight-aware rate limiting + circuit breaker** — proactively throttles
-   before Binance would reject a request, and opens a breaker (serving
-   `503` + `Retry-After` for anything not already cached) on `429`/`418`.
-
-The full design — including the exact gap-fill algorithm, storage schema,
-and the invariants that keep it correct — is in
-[`docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md`](docs/superpowers/specs/2026-08-24-binance-klines-proxy-design.md).
-See also [`CLAUDE.md`](CLAUDE.md) for the invariants future changes must
-preserve.
+The full design is in
+[`docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md`](docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md)
+— including why this replaced an earlier, more elaborate SQLite-backed
+historical cache (short version: real traffic analysis showed ~74% of
+requests structurally can't benefit from historical caching at all, since
+they ask for data reaching "now" on every call; the elaborate machinery
+was solving a problem the actual traffic mostly didn't have). See also
+[`CLAUDE.md`](CLAUDE.md) for the invariants future changes must preserve.
 
 ## Configuration
 
@@ -112,7 +100,8 @@ All configuration is via environment variables (or a `.env` file — see
 |---|---|---|
 | `SPOT_BASE_URL` | `https://api.binance.com` | Spot upstream base URL |
 | `FUTURES_BASE_URL` | `https://fapi.binance.com` | USD-M futures upstream base URL |
-| `DATA_DIR` | `./data` | Where the SQLite cache file lives |
+| `CACHE_TTL_SECONDS` | `60` | How long a cached response stays valid |
+| `CACHE_MAX_ENTRIES` | `5000` | Cache size cap (oldest-first eviction) |
 | `RATE_LIMIT_SAFETY_MARGIN` | `0.8` | Fraction of the weight budget used before proactively throttling |
 | `SPOT_WEIGHT_BUDGET_PER_MINUTE` | `6000` | Local estimate of Binance's spot weight budget (see note below) |
 | `FUTURES_WEIGHT_BUDGET_PER_MINUTE` | `2400` | Same, for futures |
@@ -123,54 +112,38 @@ All configuration is via environment variables (or a `.env` file — see
 > limits over time, and they can also differ per account. These numbers are
 > a conservative local safety net only — the proxy's actual protection
 > comes from reading Binance's own `X-MBX-USED-WEIGHT-*` response headers
-> on every call and reconciling against them in real time. Still, check
-> Binance's current documented limits for your account and adjust if
-> needed.
+> on every call and reconciling against them in real time.
 
 ## Operational notes
 
-- **Run as a single process.** Request coalescing and rate limiting rely on
-  in-memory state shared across requests. Running multiple `uvicorn`
-  workers or multiple instances would let each one coalesce/throttle
-  independently, defeating the whole point. Scale by giving this one
-  process enough resources, not by adding workers.
-- **No cache eviction.** Closed candles are immutable and small (~100
-  bytes/row); they're kept forever. A busy 1-minute series can grow to a
-  few hundred MB over years — cheap relative to the cost of re-fetching it
-  and risking a ban. Revisit if disk becomes a genuine constraint.
-- **The `1M` (calendar month) interval bypasses the cache.** Binance's
-  monthly candles don't have a fixed duration, so the gap-fill arithmetic
-  doesn't apply to them; those requests are always a live (but still
-  coalesced) passthrough call.
+- **Run as a single process.** Both the cache and request coalescing rely
+  on in-memory state shared across requests. Running multiple `uvicorn`
+  workers or multiple instances would let each one cache/throttle
+  independently, defeating the whole point.
+- **Nothing survives a restart, on purpose.** The cache is pure memory — a
+  restart just means the next 60 seconds of requests are cache misses,
+  same as normal operation. There's nothing to back up, migrate, or clean
+  up.
 - **Check `/stats`** to confirm the mechanism is doing its job in
-  production — it reports, per market, how many requests actually reached
-  Binance (`upstream_calls_made`) versus how many were coalesced
-  (`coalescing.calls_joined`), plus current weight usage and breaker state.
-- **A low overall cache-hit ratio in `/stats` doesn't necessarily mean
-  caching is broken.** A request shape like a large `limit` (e.g. 1000)
-  combined with a `startTime` near "now" always needs to re-verify against
-  Binance on every call, by construction — its implied window extends far
-  past the closed-candle boundary regardless of caching. Run
-  `scripts/monitor.py` (see below) for a check that isolates real cache
-  failures from this expected pattern.
+  production — cache hit/miss counts, coalescing counts
+  (`calls_started`/`calls_joined`), per-market upstream call counts, and
+  current weight/breaker state.
 
 ### Correctness monitoring
 
 `scripts/monitor.py` runs a complete correctness/health check against a
 live instance: code quality (pytest/ruff/mypy), response fidelity vs. the
-real Binance API, cache-hit and coalescing effectiveness, and cache
-integrity read directly from disk. Run it directly:
+real Binance API, and cache/coalescing effectiveness. Run it directly:
 
 ```bash
 .venv/bin/python scripts/monitor.py
 ```
 
 It's also wrapped by the `monitor-binance-proxy` Claude Code skill
-(`.claude/skills/monitor-binance-proxy/`), which interprets results,
-distinguishes real problems from explainable traffic patterns, and sends a
-push notification only for genuine failures — detect-and-alert only, no
-auto-remediation. A cron entry (`scripts/run_monitor_skill.sh`, every 6
-hours) runs it unattended.
+(`.claude/skills/monitor-binance-proxy/`), which interprets results and
+sends a push notification only for genuine failures — detect-and-alert
+only, no auto-remediation. A cron entry (`scripts/run_monitor_skill.sh`,
+every 6 hours) runs it unattended.
 
 ## Development
 
@@ -182,10 +155,10 @@ ruff check .            # lint
 mypy                     # type check (strict)
 ```
 
-Tests are split into `tests/unit/` (pure logic — coverage arithmetic,
-fetch planning, rate limiter, coalescing — no network) and
-`tests/integration/` (the wired-together system against a
-[respx](https://lundberg.github.io/respx/)-mocked Binance backend).
+Tests are split into `tests/unit/` (pure logic — the TTL cache, rate
+limiter, coalescing — no network) and `tests/integration/` (the wired-
+together system against a [respx](https://lundberg.github.io/respx/)-
+mocked Binance backend).
 
 ## License
 

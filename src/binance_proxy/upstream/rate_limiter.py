@@ -85,6 +85,16 @@ class RateLimiter:
 
                 self._roll_window_if_expired()
                 if self._used_weight + weight > self._usable_budget():
+                    if weight > self._usable_budget():
+                        # This single request's weight alone exceeds the
+                        # entire usable budget (e.g. an overly aggressive
+                        # RATE_LIMIT_SAFETY_MARGIN). No amount of waiting for
+                        # a window reset ever satisfies this — looping would
+                        # spin forever. Proceed best-effort instead; if
+                        # Binance actually rejects it, the circuit breaker
+                        # (RateLimiter.on_response) still catches that.
+                        self._used_weight += weight
+                        return
                     remaining = self._window_seconds - (self._now() - self._window_start)
                     await self._sleep(max(remaining, 0.0))
                     continue

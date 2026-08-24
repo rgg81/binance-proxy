@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -13,7 +11,11 @@ class Settings(BaseSettings):
     spot_base_url: str = "https://api.binance.com"
     futures_base_url: str = "https://fapi.binance.com"
 
-    data_dir: Path = Path("./data")
+    # How long a cached response stays valid before being treated as stale
+    # and re-fetched. There is no persistence and no history — this is the
+    # entire cache policy.
+    cache_ttl_seconds: float = 60.0
+    cache_max_entries: int = 5000
 
     # Fraction of Binance's per-minute weight budget we allow ourselves to
     # use before proactively throttling outbound requests.
@@ -31,10 +33,6 @@ class Settings(BaseSettings):
     port: int = 8000
 
     log_level: str = "INFO"
-
-    @property
-    def db_path(self) -> Path:
-        return self.data_dir / "klines.db"
 
 
 settings = Settings()
