@@ -141,12 +141,9 @@ class TestErrorPassthrough:
         assert response.status_code == 400
         assert response.json() == error_body
 
-    def test_binance_error_is_not_cached_asks_again_next_time(self, respx_mock):
+    def test_binance_error_is_cached_and_not_retried_within_ttl(self, respx_mock):
         route = respx_mock.get(f"{SPOT_BASE}/api/v3/klines").mock(
-            side_effect=[
-                httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."}),
-                httpx.Response(200, json=[binance_row(0)]),
-            ]
+            return_value=httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
         )
         client = make_client()
         params = {"symbol": "BADSYM", "interval": "1m", "limit": 1}
@@ -154,9 +151,8 @@ class TestErrorPassthrough:
         first = client.get("/api/v3/klines", params=params)
         second = client.get("/api/v3/klines", params=params)
 
-        assert first.status_code == 400
-        assert second.status_code == 200
-        assert route.call_count == 2
+        assert first.status_code == second.status_code == 400
+        assert route.call_count == 1
 
 
 class TestUpstreamUnavailableHandling:

@@ -149,3 +149,37 @@ an independent real Binance call), and coalescing effectiveness.
   propagation behavior `coalescing.py` already documents as an accepted,
   pre-existing tradeoff rather than something this redesign introduced.
   See the commit history for the full reasoning on each.
+
+## Incident: 2026-08-28 USD-M futures ban
+
+Roughly 4 days after deployment, the futures market got 418-banned for the
+first time (spot unaffected). The monitor's own cron schedule had silently
+never actually run since being set up — a PATH issue specific to cron's
+minimal environment (`claude: command not found`; fixed separately, see
+`.claude/skills/monitor-binance-proxy/`) — so nobody was alerted until
+asked directly. Once fixed and re-run, the monitor's own investigation
+(cross-checked manually) found three contributing causes:
+
+1. **The cache is close to a no-op for this workload at scale.** 849
+   distinct symbols × tens of thousands of distinct URL combinations
+   against a 60s TTL produced a 6.3% hit rate. Consistent with — and
+   worse than — the original ~74%-can't-benefit finding, since the
+   symbol sweep had grown since that analysis.
+2. **~546 permanently-invalid futures symbols were queried repeatedly.**
+   ~10% of all upstream calls were wasted 400s for symbols that don't
+   exist on USD-M futures. Because errors weren't cached (the original
+   design), every retry burned a fresh call for zero possible benefit —
+   pure waste, and a direct, measurable contributor to the ban. **Fixed
+   here**: errors are now cached too (invariant #2).
+3. **A different project's script bypasses the proxy entirely**,
+   consuming the same IP's Binance weight budget invisibly to this
+   proxy's rate limiter. Out of this repo's scope to fix directly; flagged
+   to the caller.
+
+The proxy's own weight-tracking/reservation/reconciliation/circuit-breaker
+mechanism was confirmed working exactly as designed throughout — this was
+a demand problem the cache/coalescing layer couldn't fully absorb, not a
+bug in the rate limiter. Two changes came out of it: caching errors too
+(invariant #2), and logging a warning whenever the circuit breaker trips
+(invariant #8) — the previous absence of that log line made root-causing
+this incident materially harder than it needed to be.

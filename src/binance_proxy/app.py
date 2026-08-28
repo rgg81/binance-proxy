@@ -48,11 +48,13 @@ def create_app(settings: Settings = default_settings) -> FastAPI:
         safety_margin=settings.rate_limit_safety_margin,
         now_fn=time.monotonic,
         sleep_fn=asyncio.sleep,
+        market=Market.SPOT.value,
     )
     futures_limiter = RateLimiter(
         budget_per_window=settings.futures_weight_budget_per_minute,
         window_seconds=60.0,
         safety_margin=settings.rate_limit_safety_margin,
+        market=Market.USDM_FUTURES.value,
         now_fn=time.monotonic,
         sleep_fn=asyncio.sleep,
     )

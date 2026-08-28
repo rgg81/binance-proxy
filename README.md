@@ -69,10 +69,13 @@ curl "http://localhost:8000/api/v3/klines?symbol=BTCUSDT&interval=1m&limit=5"
 | `GET /stats` | — | cache/coalescing/rate-limit visibility |
 
 Any query parameter Binance's klines endpoint accepts is forwarded as-is —
-there's no hardcoded list to keep in sync. Invalid-request errors from
-Binance are passed through with the same status code and JSON body, and are
-never cached (so fixing a bad request is immediately reflected, not stuck
-behind a stale cached error).
+there's no hardcoded list to keep in sync. Errors from Binance (invalid
+symbol, bad params, etc.) are passed through with the same status code and
+JSON body, and are cached for the same TTL as a successful response — a
+caller repeatedly requesting something permanently invalid (e.g. a symbol
+that doesn't exist on that market) doesn't burn a fresh upstream call on
+every single retry. The tradeoff: a genuinely transient error can be
+replayed from cache for up to `CACHE_TTL_SECONDS`.
 
 ## Architecture
 

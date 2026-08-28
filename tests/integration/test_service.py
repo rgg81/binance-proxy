@@ -84,23 +84,31 @@ class TestCacheHit:
         assert r2 == (200, [["new"]])
 
 
-class TestErrorsAreNeverCached:
-    async def test_client_error_is_not_cached_and_is_retried_next_time(self, respx_mock):
+class TestErrorsAreCachedToo:
+    """A permanently-invalid request (e.g. a symbol that doesn't exist on a
+    given market) gets the exact same 4xx from Binance every time — caching
+    it, same as a 200, stops a caller that keeps retrying a bad request from
+    burning a fresh upstream call on every single attempt. Confirmed as a
+    real, measurable contributor to a production ban: ~10% of all upstream
+    calls were wasted retries of ~546 permanently-invalid futures symbols
+    (see docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md's
+    follow-up incident notes). The tradeoff — a genuinely transient error
+    could be replayed from cache for up to CACHE_TTL_SECONDS — is accepted;
+    see CLAUDE.md invariant #2.
+    """
+
+    async def test_client_error_is_cached_and_not_retried_within_ttl(self, respx_mock):
         service = make_service()
         route = respx_mock.get(KLINES_URL).mock(
-            side_effect=[
-                httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."}),
-                httpx.Response(200, json=[["now valid"]]),
-            ]
+            return_value=httpx.Response(400, json={"code": -1121, "msg": "Invalid symbol."})
         )
         params = {"symbol": "BADSYMBOL"}
 
         r1 = await service.get(Market.SPOT, "/api/v3/klines", params)
         r2 = await service.get(Market.SPOT, "/api/v3/klines", params)
 
-        assert route.call_count == 2  # not cached -> asked again
-        assert r1 == (400, {"code": -1121, "msg": "Invalid symbol."})
-        assert r2 == (200, [["now valid"]])
+        assert route.call_count == 1  # cached -> not asked again
+        assert r1 == r2 == (400, {"code": -1121, "msg": "Invalid symbol."})
 
 
 class TestSingleFlightCoalescing:

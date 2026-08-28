@@ -55,7 +55,15 @@ first, the same way you would for any bug report on this project.
    doesn't corrupt what it stores — it forces a cache-served response
    (proven via a zero-upstream-call signal) and compares that against real
    Binance, not just against the proxy's own earlier response.
-3. For a `malformed_input_does_not_crash` failure: Binance is the sole
+3. For an `error_responses_are_cached` failure: this is a regression check
+   for the *confirmed, actual root cause* of a real production 418 ban on
+   2026-08-28 — a caller repeatedly querying ~546 symbols invalid on
+   USD-M futures burned a fresh upstream call on every single retry
+   (~10% of all upstream calls) because errors weren't being cached
+   (CLAUDE.md invariant #2). A failure here means the proxy is back to
+   that exact wasteful, ban-contributing behavior — treat it as urgent,
+   not a flaky signal.
+4. For a `malformed_input_does_not_crash` failure: Binance is the sole
    source of truth for request validity here (CLAUDE.md invariant #5) —
    the proxy does no local validation, so a bad param must still relay
    Binance's own error response, never crash with a raw 500. This is a
@@ -63,16 +71,28 @@ first, the same way you would for any bug report on this project.
    once crashed the proxy before the request ever reached Binance
    (invariant #6). A failure here is a real regression, not a flaky
    network signal — treat it as such immediately.
-4. For a `coalescing` failure: `N` concurrent identical requests should
+5. For a `coalescing` failure: `N` concurrent identical requests should
    collapse to at most one upstream call. A failure here means the
    single-flight mechanism — the direct fix for "many desks call the same
    thing in parallel" — isn't working, which is the core reason this
    proxy exists.
-5. For a `pytest`, `ruff`, or `mypy` failure (three separately-named
+6. For a `pytest`, `ruff`, or `mypy` failure (three separately-named
    results, not one combined check): this means the *deployed code
    itself* regressed — read the actual failing test/lint/type output
    (full output is in the report JSON if the printed tail isn't enough)
    and treat it like any other broken test in this repo.
+7. **If `markets.<market>.banned` is ever true in `/stats`** (check it
+   directly, not just via the fidelity checks above, which only catch a
+   ban indirectly): this is the exact failure this whole project exists
+   to prevent. Read `RateLimiter`'s warning-level log line (invariant #8)
+   for the market/status/duration/used-weight at the moment it tripped,
+   check `logs/proxy.log` for the request pattern around that point (symbol
+   diversity, repeated invalid symbols, request volume), and check whether
+   anything else on this machine calls Binance directly for the same
+   market, bypassing this proxy's rate limiter entirely (this was a real,
+   confirmed contributing factor once already — grep other projects on
+   this machine for hardcoded `api.binance.com`/`fapi.binance.com`).
+   Always alert on this, regardless of what caused it.
 
 Once you've determined it's a real problem, send a push notification with
 a concise, specific summary — this is exactly the kind of thing worth

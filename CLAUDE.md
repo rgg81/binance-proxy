@@ -49,12 +49,23 @@ response gets cached; anything else does not. That's the entire system —
    `startTime`, no understanding intervals). The moment this cache tries
    to be clever about overlapping ranges, it has become the old design
    again — that complexity was deliberately removed.
-2. **Only a 200 response is ever cached.** `ProxyService.get()`'s
-   `do_work()` checks `if status_code == 200` before calling
-   `cache.set(...)`. An error must always be retried on the next call, not
-   stuck being replayed from cache — that's what
-   `TestErrorsAreNeverCached` in `tests/integration/test_service.py`
-   verifies.
+2. **Every completed response is cached, including errors — not just
+   200s.** `ProxyService.get()`'s `do_work()` caches whatever
+   `UpstreamClient.fetch()` returns unconditionally (that method already
+   raises rather than returning for 429/418 and for transport/parse
+   failures — see invariant on `UpstreamUnavailableError` below — so
+   anything reaching `do_work()`'s cache.set() is a completed round trip).
+   **This reverses the original design** (v0.2.0 only cached 200s) after a
+   real production incident on 2026-08-28: a caller repeatedly querying
+   ~546 symbols invalid on USD-M futures burned a fresh, wasted upstream
+   call on every single retry (~10% of all upstream calls), a measurable
+   contributor to a 418 ban. See
+   `docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md`'s
+   incident notes. The accepted tradeoff: a genuinely transient error can
+   now be replayed from cache for up to `CACHE_TTL_SECONDS`. Do not
+   special-case 200 back in here without a similarly deliberate,
+   evidence-based reason — see `TestErrorsAreCachedToo` in
+   `tests/integration/test_service.py`.
 3. **This proxy is single-process by design.** Both the cache
    (`cache.py::TTLCache`) and coalescing (`coalescing.py::Coalescer`) are
    plain in-memory state with no cross-process coordination. Do not add
@@ -98,6 +109,16 @@ response gets cached; anything else does not. That's the entire system —
    against exactly this class of bug with a hard call-count cap rather
    than a wall-clock timeout, because a wall-clock timeout is not
    reliably able to interrupt this kind of tight loop.
+8. **A 429/418 from Binance must always log a warning** (`RateLimiter.
+   on_response`, via stdlib `logging`, module logger in
+   `upstream/rate_limiter.py`) identifying the market, the status code,
+   the backoff duration, and the tracked used-weight at the time. Root-
+   causing the 2026-08-28 ban (see invariant #2) required reconstructing
+   what happened after the fact from access logs and `/stats` snapshots
+   alone, because nothing logged the ban event itself when it occurred —
+   don't let that gap reopen. `RateLimiter` takes a `market` label
+   (`app.py` passes `Market.SPOT.value`/`Market.USDM_FUTURES.value`)
+   purely so these log lines are attributable.
 
 ## Architecture map
 

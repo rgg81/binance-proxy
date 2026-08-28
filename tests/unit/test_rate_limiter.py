@@ -48,7 +48,7 @@ class FakeSleeper:
         self.clock.advance(seconds)
 
 
-def make_limiter(*, budget=100, window_seconds=60.0, safety_margin=0.8, clock=None):
+def make_limiter(*, budget=100, window_seconds=60.0, safety_margin=0.8, clock=None, market="test"):
     clock = clock or FakeClock()
     sleeper = FakeSleeper(clock)
     limiter = RateLimiter(
@@ -57,6 +57,7 @@ def make_limiter(*, budget=100, window_seconds=60.0, safety_margin=0.8, clock=No
         safety_margin=safety_margin,
         now_fn=clock,
         sleep_fn=sleeper,
+        market=market,
     )
     return limiter, clock, sleeper
 
@@ -120,6 +121,49 @@ class TestCircuitBreaker:
         limiter, _clock, _sleeper = make_limiter()
         limiter.on_response(200, {"X-MBX-USED-WEIGHT-1M": "5"})
         assert limiter.is_banned() is False
+
+
+class TestBreakerTripIsLogged:
+    """A ban is exactly the failure mode this whole project exists to
+    prevent — when one happens anyway, diagnosing why must not require
+    forensic reconstruction from access logs and /stats snapshots alone.
+    Confirmed the hard way: a real production ban took an extended,
+    multi-angle investigation to root-cause because nothing logged the
+    418/429 itself when it happened.
+    """
+
+    async def test_418_logs_a_warning_identifying_the_market_and_duration(self, caplog):
+        import logging
+
+        limiter, _clock, _sleeper = make_limiter(market="usdm_futures")
+        with caplog.at_level(logging.WARNING):
+            limiter.on_response(418, {"Retry-After": "120"})
+
+        assert len(caplog.records) == 1
+        message = caplog.records[0].message
+        assert "usdm_futures" in message
+        assert "418" in message
+        assert "120" in message
+
+    async def test_429_logs_a_warning(self, caplog):
+        import logging
+
+        limiter, _clock, _sleeper = make_limiter(market="spot")
+        with caplog.at_level(logging.WARNING):
+            limiter.on_response(429, {"Retry-After": "5"})
+
+        assert len(caplog.records) == 1
+        assert "spot" in caplog.records[0].message
+        assert "429" in caplog.records[0].message
+
+    async def test_success_does_not_log_anything(self, caplog):
+        import logging
+
+        limiter, _clock, _sleeper = make_limiter()
+        with caplog.at_level(logging.WARNING):
+            limiter.on_response(200, {"X-MBX-USED-WEIGHT-1M": "5"})
+
+        assert caplog.records == []
 
 
 class TestAcquireNeverDeadlocksOnAnUnsatisfiableWeight:

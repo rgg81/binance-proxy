@@ -18,16 +18,23 @@ these checks are simpler too:
   1. The proxy process is up and /healthz responds.
   2. The deployed code is still correct: full pytest + ruff + mypy (three
      separately-named results: "pytest", "ruff", "mypy").
-  3. Response fidelity vs. the real Binance API (spot + futures) — the
+  3. Neither market is currently banned (checked directly via /stats, not
+     just inferred from a fidelity mismatch) — the exact failure this
+     project exists to prevent, and the thing a real production incident
+     confirmed wasn't being alerted on loudly enough.
+  4. Response fidelity vs. the real Binance API (spot + futures) — the
      proxy forwards params verbatim and must relay Binance's answer
      unchanged.
-  4. A repeated identical request within the TTL is served from cache
+  5. A repeated identical request within the TTL is served from cache
      (zero new upstream calls) and matches real Binance — proves the cache
      round-trip doesn't corrupt anything, not just that it's self-consistent.
-  5. A malformed query param (e.g. a non-numeric `limit`) must still reach
+  6. An error response (e.g. an invalid symbol) is cached too, not
+     re-fetched on every repeat — regression check for the confirmed root
+     cause of a real production ban (CLAUDE.md invariant #2).
+  7. A malformed query param (e.g. a non-numeric `limit`) must still reach
      Binance, not crash the proxy with a raw 500 — regression check for a
      real, previously-fixed bug (CLAUDE.md invariant #6).
-  6. Concurrent identical requests collapse to one upstream call.
+  8. Concurrent identical requests collapse to one upstream call.
 """
 
 from __future__ import annotations
@@ -64,7 +71,7 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
-# -- 1. process / liveness -------------------------------------------------
+# -- 1. process / liveness / ban status --------------------------------------
 
 
 def check_healthz(client: httpx.Client) -> CheckResult:
@@ -74,6 +81,28 @@ def check_healthz(client: httpx.Client) -> CheckResult:
         return CheckResult("proxy_healthz", ok, f"status={r.status_code} body={r.text}")
     except httpx.HTTPError as exc:
         return CheckResult("proxy_healthz", False, f"unreachable: {exc}")
+
+
+def check_not_banned(client: httpx.Client) -> CheckResult:
+    """Direct check of the exact failure this whole project exists to
+    prevent, rather than relying on it surfacing indirectly through a
+    fidelity-check mismatch (which is how the 2026-08-28 ban was first
+    noticed — it worked, but required interpretation to trace back to a
+    ban rather than being immediately obvious).
+    """
+    try:
+        stats = client.get("/stats", timeout=10).json()
+    except httpx.HTTPError as exc:
+        return CheckResult("not_banned", False, f"request failed: {exc}")
+
+    banned = {
+        market: info["seconds_until_unbanned"]
+        for market, info in stats.get("markets", {}).items()
+        if info.get("banned")
+    }
+    ok = not banned
+    detail = "no market banned" if ok else f"BANNED: {banned} (seconds remaining)"
+    return CheckResult("not_banned", ok, detail)
 
 
 # -- 2. deployed code correctness ------------------------------------------
@@ -176,7 +205,49 @@ def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> Che
     )
 
 
-# -- 5. malformed input must never crash the proxy ---------------------------
+# -- 5. error responses must be cached too, not retried every time ----------
+
+
+def check_error_responses_are_cached(client: httpx.Client) -> CheckResult:
+    """Regression check for the actual, confirmed root cause of the
+    2026-08-28 production ban (CLAUDE.md invariant #2): a request for a
+    symbol invalid on the target market must not re-hit Binance on every
+    repeat within the TTL. ~546 permanently-invalid futures symbols being
+    retried this way, uncached, was ~10% of all upstream calls and a
+    direct, measurable contributor to that ban.
+
+    The invalid symbol includes the current timestamp so this check is
+    never accidentally satisfied by a stale cache entry left over from a
+    previous run (within CACHE_TTL_SECONDS) — that would make
+    `first_call_made` false for a reason that has nothing to do with
+    whether caching is actually working right now.
+    """
+    params: dict[str, str | int] = {
+        "symbol": f"NOTREALSYMBOL{_now_ms()}",
+        "interval": "1m",
+        "limit": 1,
+    }
+    try:
+        before = _spot_upstream_calls(client)
+        r1 = client.get("/api/v3/klines", params=params, timeout=15)
+        mid = _spot_upstream_calls(client)
+        r2 = client.get("/api/v3/klines", params=params, timeout=15)
+        after = _spot_upstream_calls(client)
+    except httpx.HTTPError as exc:
+        return CheckResult("error_responses_are_cached", False, f"request failed: {exc}")
+
+    first_call_made = mid > before
+    second_call_avoided = after == mid
+    ok = first_call_made and second_call_avoided and r1.status_code == r2.status_code
+    return CheckResult(
+        "error_responses_are_cached",
+        ok,
+        f"first_call_made={first_call_made} second_call_avoided={second_call_avoided} "
+        f"status={r1.status_code}",
+    )
+
+
+# -- 6. malformed input must never crash the proxy ---------------------------
 
 
 def check_malformed_input_does_not_crash(client: httpx.Client) -> CheckResult:
@@ -202,7 +273,7 @@ def check_malformed_input_does_not_crash(client: httpx.Client) -> CheckResult:
     )
 
 
-# -- 6. coalescing effectiveness ---------------------------------------------
+# -- 7. coalescing effectiveness ---------------------------------------------
 
 
 def check_coalescing(client: httpx.Client, n: int = 15) -> CheckResult:
@@ -256,9 +327,11 @@ def run_all(proxy_url: str, skip_code_quality: bool) -> list[CheckResult]:
 
         # Only run live/network checks if the proxy is actually reachable.
         if results[0].passed:
+            results.append(check_not_banned(client))
             results.append(check_response_fidelity(client, real, "BTCUSDT", "spot"))
             results.append(check_response_fidelity(client, real, "BTCUSDT", "usdm_futures"))
             results.append(check_cache_served_fidelity(client, real))
+            results.append(check_error_responses_are_cached(client))
             results.append(check_malformed_input_does_not_crash(client))
             results.append(check_coalescing(client))
 

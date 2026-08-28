@@ -2,7 +2,17 @@
 # Cron entry point: runs the monitor-binance-proxy skill headlessly via the
 # Claude Code CLI. Detect-and-alert only — see the skill's Scope section for
 # why this deliberately never lets the scheduled run modify code.
+#
+# cron runs with a minimal PATH (no ~/.local/bin), unlike an interactive
+# shell — the same reason binance_proxy.sh (the uptime watchdog) exports
+# PATH explicitly. Without this, `claude` silently fails as "command not
+# found" and the entire monitor run is a no-op: no report, no alert, ever
+# — which is exactly what happened here for three days straight before
+# this fix (see git history). Always test cron scripts with `env -i` or
+# equivalent, not just an interactive shell, where PATH hides this class
+# of bug completely.
 set -euo pipefail
+export PATH="$HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 

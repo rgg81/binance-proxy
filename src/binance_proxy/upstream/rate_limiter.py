@@ -10,7 +10,10 @@ without real waiting.
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable, Mapping
+
+logger = logging.getLogger(__name__)
 
 NowFn = Callable[[], float]
 SleepFn = Callable[[float], Awaitable[None]]
@@ -42,12 +45,14 @@ class RateLimiter:
         safety_margin: float,
         now_fn: NowFn,
         sleep_fn: SleepFn,
+        market: str = "unknown",
     ) -> None:
         self._budget = budget_per_window
         self._window_seconds = window_seconds
         self._safety_margin = safety_margin
         self._now = now_fn
         self._sleep = sleep_fn
+        self._market = market
 
         self._window_start = self._now()
         self._used_weight = 0
@@ -115,9 +120,23 @@ class RateLimiter:
         if status_code == 429:
             retry_after = self._parse_retry_after(headers, default=_DEFAULT_429_BACKOFF_SECONDS)
             self._trip(retry_after)
+            logger.warning(
+                "binance-proxy: %s market got 429 from Binance, backing off for %.0fs "
+                "(used_weight=%s)",
+                self._market,
+                retry_after,
+                self._used_weight,
+            )
         elif status_code == 418:
             retry_after = self._parse_retry_after(headers, default=_DEFAULT_BAN_SECONDS)
             self._trip(retry_after)
+            logger.warning(
+                "binance-proxy: %s market got 418 BANNED from Binance, backing off for "
+                "%.0fs (used_weight=%s)",
+                self._market,
+                retry_after,
+                self._used_weight,
+            )
 
     def _trip(self, retry_after_seconds: float) -> None:
         candidate = self._now() + retry_after_seconds
