@@ -36,9 +36,10 @@ calls. A miss goes through `Coalescer.coalesce()`: if an identical request
 is already in flight, this caller awaits that result instead of starting
 its own fetch. Only the caller that actually starts the fetch talks to
 Binance, through `RateLimiter`/`UpstreamClient` (weight throttle +
-circuit breaker, unchanged from the original design). A successful (200)
-response gets cached; anything else does not. That's the entire system —
-`service.py` is ~40 lines.
+circuit breaker, unchanged from the original design). A 200 or 4xx
+response gets cached; a 5xx does not (see invariant #2 for why 4xx and
+5xx are treated differently). That's the entire system — `service.py` is
+~40 lines.
 
 ## Invariants — do not break these
 
@@ -49,23 +50,31 @@ response gets cached; anything else does not. That's the entire system —
    `startTime`, no understanding intervals). The moment this cache tries
    to be clever about overlapping ranges, it has become the old design
    again — that complexity was deliberately removed.
-2. **Every completed response is cached, including errors — not just
-   200s.** `ProxyService.get()`'s `do_work()` caches whatever
-   `UpstreamClient.fetch()` returns unconditionally (that method already
-   raises rather than returning for 429/418 and for transport/parse
-   failures — see invariant on `UpstreamUnavailableError` below — so
-   anything reaching `do_work()`'s cache.set() is a completed round trip).
-   **This reverses the original design** (v0.2.0 only cached 200s) after a
-   real production incident on 2026-08-28: a caller repeatedly querying
-   ~546 symbols invalid on USD-M futures burned a fresh, wasted upstream
-   call on every single retry (~10% of all upstream calls), a measurable
-   contributor to a 418 ban. See
+2. **A 200 or 4xx response is cached; a 5xx is not.**
+   `ProxyService.get()`'s `do_work()` checks `if status_code < 500` before
+   `cache.set()`. `UpstreamClient.fetch()` already raises rather than
+   returning for 429/418 and for transport/parse failures (see
+   `UpstreamUnavailableError`, invariant #6), so anything reaching this
+   check is a completed round trip. **The 4xx-caching half reverses the
+   original design** (v0.2.0 only cached 200s) after a real production
+   incident on 2026-08-28: a caller repeatedly querying ~546 symbols
+   invalid on USD-M futures burned a fresh, wasted upstream call on every
+   single retry (~10% of all upstream calls), a measurable contributor to
+   a 418 ban. See
    `docs/superpowers/specs/2026-08-24-simple-memory-cache-redesign.md`'s
-   incident notes. The accepted tradeoff: a genuinely transient error can
-   now be replayed from cache for up to `CACHE_TTL_SECONDS`. Do not
-   special-case 200 back in here without a similarly deliberate,
-   evidence-based reason — see `TestErrorsAreCachedToo` in
-   `tests/integration/test_service.py`.
+   incident notes. **The 4xx/5xx split is deliberate, not an oversight**:
+   a 4xx means the *request* is invalid (deterministic — the same bad
+   params always get the same answer, so caching it is free and directly
+   fixes the incident above), while a 5xx means *Binance's own state* at
+   that moment (not deterministic, could resolve moments later — caching
+   it would silently mask a real Binance-side outage from every caller
+   hitting that key for up to `CACHE_TTL_SECONDS`, a cost the 4xx
+   reasoning doesn't justify). The accepted tradeoff for the 4xx case: a
+   genuinely transient 4xx can be replayed from cache for up to
+   `CACHE_TTL_SECONDS`. Do not special-case 200 back in, and do not start
+   caching 5xx too, without a similarly deliberate, evidence-based reason
+   — see `TestClientErrorsAreCachedToo` and `TestServerErrorsAreNotCached`
+   in `tests/integration/test_service.py`.
 3. **This proxy is single-process by design.** Both the cache
    (`cache.py::TTLCache`) and coalescing (`coalescing.py::Coalescer`) are
    plain in-memory state with no cross-process coordination. Do not add

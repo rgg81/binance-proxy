@@ -53,9 +53,18 @@ old entries stop being useful and get replaced or would fail eviction
 checks — the cap just guards the case of very high param-combination
 cardinality within one TTL window).
 
-Only successful (`200`) responses are cached. Anything else — a client
-error, a server error — is never cached, so a caller fixing a bad request
-sees that reflected immediately rather than replaying a stale error.
+**Updated by the 2026-08-28 incident below**: originally, only successful
+(`200`) responses were cached — anything else was never cached, so a
+caller fixing a bad request would see that reflected immediately. In
+production this meant a caller repeatedly retrying a *permanently*
+invalid request (e.g. a symbol that doesn't exist on a market) burned a
+fresh upstream call on every single attempt, forever — a real, measurable
+contributor to a production ban (see the Incident section). As of that
+incident, a 200 **or 4xx** response is cached; only a 5xx is not. A 4xx
+means the request itself is invalid — deterministic, so caching it is
+free — while a 5xx means Binance's own transient state, which caching
+would silently mask for up to the TTL. See CLAUDE.md invariant #2 for the
+full reasoning.
 
 ### Coalescing
 
@@ -170,16 +179,25 @@ asked directly. Once fixed and re-run, the monitor's own investigation
    exist on USD-M futures. Because errors weren't cached (the original
    design), every retry burned a fresh call for zero possible benefit —
    pure waste, and a direct, measurable contributor to the ban. **Fixed
-   here**: errors are now cached too (invariant #2).
+   here**: 4xx responses are now cached too (invariant #2) — 5xx
+   deliberately isn't, since unlike a permanently-invalid request, a
+   server error isn't deterministic and caching it would mask a real
+   Binance-side outage instead.
 3. **A different project's script bypasses the proxy entirely**,
    consuming the same IP's Binance weight budget invisibly to this
-   proxy's rate limiter. Out of this repo's scope to fix directly; flagged
-   to the caller.
+   proxy's rate limiter. Fixed in that project (not this repo): the
+   script now checks this proxy's own `/stats` before running and skips
+   its run entirely while `usdm_futures.banned` is true, so it stops
+   adding load during an active ban instead of piling on invisibly.
 
 The proxy's own weight-tracking/reservation/reconciliation/circuit-breaker
 mechanism was confirmed working exactly as designed throughout — this was
 a demand problem the cache/coalescing layer couldn't fully absorb, not a
-bug in the rate limiter. Two changes came out of it: caching errors too
-(invariant #2), and logging a warning whenever the circuit breaker trips
-(invariant #8) — the previous absence of that log line made root-causing
-this incident materially harder than it needed to be.
+bug in the rate limiter. Changes that came out of it: caching 4xx
+responses too (invariant #2), logging a warning whenever the circuit
+breaker trips (invariant #8) — the previous absence of that log line made
+root-causing this incident materially harder than it needed to be — and,
+found by a follow-up adversarial review of the incident-response fixes
+themselves, a `Retry-After: inf`/`nan` header would have permanently
+bricked or silently disabled the breaker (`_parse_retry_after` now
+rejects non-finite/negative values).

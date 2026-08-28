@@ -5,16 +5,21 @@ entry is just "the exact response Binance gave us for this exact request,
 less than TTL seconds ago." A cache miss means asking Binance again, same
 as if there were no cache at all — just less often.
 
-Every response Binance gives us for a request that completes (i.e. that
-UpstreamClient.fetch() returns rather than raises — see its docstring: it
-raises rather than returning for 429/418 and for transport/parse failures)
-is cached, including 4xx/5xx errors — not just 200s. This is deliberate: a
-caller retrying a permanently-invalid request (e.g. a symbol that doesn't
-exist on a given market) would otherwise burn a fresh upstream call on
-every single attempt forever, since the error never changes. Confirmed as
-a real, measurable contributor to a production ban — see CLAUDE.md
-invariant #2 for the incident this traces back to. The accepted tradeoff:
-a genuinely transient error can be replayed from cache for up to
+A 200 or 4xx response is cached; a 5xx is not. UpstreamClient.fetch()
+already raises rather than returning for 429/418 and for transport/parse
+failures (see its docstring), so anything reaching do_work() is a
+completed round trip. Within that: a 4xx means the *request itself* is
+invalid — deterministic, since the same bad params always get the same
+answer — so caching it stops a caller retrying a permanently-invalid
+request (e.g. a symbol that doesn't exist on a given market) from burning
+a fresh upstream call on every single attempt forever. Confirmed as a
+real, measurable contributor to a production ban — see CLAUDE.md
+invariant #2. A 5xx means *Binance's own state* at that moment, which
+isn't deterministic and could resolve moments later — caching it would
+silently mask a real Binance-side outage from every caller hitting that
+key for up to CACHE_TTL_SECONDS, a cost the 4xx case's reasoning doesn't
+apply to and doesn't justify. The accepted tradeoff for the 4xx case: a
+genuinely transient 4xx can be replayed from cache for up to
 CACHE_TTL_SECONDS.
 """
 
@@ -45,7 +50,8 @@ class ProxyService:
 
         async def do_work() -> tuple[int, object]:
             status_code, body = await self.clients[market].fetch(path, params)
-            self.cache.set(key, status_code, body)
+            if status_code < 500:
+                self.cache.set(key, status_code, body)
             return status_code, body
 
         return await self.coalescer.coalesce(key, do_work)

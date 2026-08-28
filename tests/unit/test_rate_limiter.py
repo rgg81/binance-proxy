@@ -122,6 +122,46 @@ class TestCircuitBreaker:
         limiter.on_response(200, {"X-MBX-USED-WEIGHT-1M": "5"})
         assert limiter.is_banned() is False
 
+    async def test_retry_after_of_inf_does_not_permanently_brick_the_market(self):
+        # float("inf") parses without raising, so a naive float() cast would
+        # set banned_until to infinity — permanently bricking the market
+        # until a process restart, for no better reason than a malformed or
+        # malicious Retry-After header. Must fall back to the safe default
+        # instead of trusting a non-finite value.
+        limiter, _clock, _sleeper = make_limiter()
+        limiter.on_response(418, {"Retry-After": "inf"})
+        assert limiter.is_banned() is True
+        assert limiter.seconds_until_unbanned() < 10_000  # some sane, finite bound
+
+    async def test_retry_after_of_nan_does_not_silently_disable_the_breaker(self):
+        # float("nan") also parses without raising. Every comparison against
+        # NaN is False, so `now < banned_until` (is_banned's check) would
+        # silently and permanently return False even after _trip() "ran" —
+        # a silent bypass of ban protection, worse than not tripping at all.
+        limiter, _clock, _sleeper = make_limiter()
+        limiter.on_response(418, {"Retry-After": "nan"})
+        assert limiter.is_banned() is True
+        assert limiter.seconds_until_unbanned() > 0
+
+    async def test_used_weight_is_current_in_the_log_even_without_a_weight_header(self, caplog):
+        # A ban response doesn't always include a weight header. The window
+        # must still be rolled before used_weight is read for the log line —
+        # otherwise a ban long after the last header-bearing response logs a
+        # stale figure from a prior window, undermining the one thing this
+        # log line exists to get right: accurate root-cause diagnosis.
+        import logging
+
+        clock = FakeClock()
+        limiter, _clock, _sleeper = make_limiter(clock=clock, budget=100, window_seconds=60.0)
+        await limiter.acquire(50)  # reserve weight in the current window
+        clock.advance(61.0)  # window has now expired
+
+        with caplog.at_level(logging.WARNING):
+            limiter.on_response(418, {})  # no weight header
+
+        assert limiter.used_weight() == 0  # rolled over, not stale 50
+        assert "used_weight=0" in caplog.records[0].message
+
 
 class TestBreakerTripIsLogged:
     """A ban is exactly the failure mode this whole project exists to

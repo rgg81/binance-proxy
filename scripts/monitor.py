@@ -30,7 +30,10 @@ these checks are simpler too:
      round-trip doesn't corrupt anything, not just that it's self-consistent.
   6. An error response (e.g. an invalid symbol) is cached too, not
      re-fetched on every repeat — regression check for the confirmed root
-     cause of a real production ban (CLAUDE.md invariant #2).
+     cause of a real production ban (CLAUDE.md invariant #2). Checked on
+     both spot and usdm_futures: the actual incident was futures-specific,
+     so a spot-only version of this check could pass right through a
+     futures-only regression.
   7. A malformed query param (e.g. a non-numeric `limit`) must still reach
      Binance, not crash the proxy with a raw 500 — regression check for a
      real, previously-fixed bug (CLAUDE.md invariant #6).
@@ -49,6 +52,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import httpx
 
@@ -83,6 +87,24 @@ def check_healthz(client: httpx.Client) -> CheckResult:
         return CheckResult("proxy_healthz", False, f"unreachable: {exc}")
 
 
+# Any of these can legitimately happen from a malformed/degraded /stats
+# response (bad JSON, a missing or renamed field) — every check that reads
+# /stats must fail cleanly with a CheckResult, never crash run_all() and
+# take the whole report down with it. That would repeat, for a different
+# reason, exactly the "silent total monitoring failure" this project
+# already had once (see the cron-PATH fix in this same commit).
+_STATS_ERRORS = (httpx.HTTPError, ValueError, KeyError, TypeError)
+
+
+def _get_stats(client: httpx.Client) -> dict[str, Any]:
+    # Any, not a nested typed shape: this is untyped JSON off the wire, and
+    # monitor.py isn't part of the project's strict-mypy scope (pyproject.toml
+    # `[tool.mypy] files = ["src"]`) — a fully typed /stats schema belongs
+    # there if it's ever worth adding, not duplicated ad hoc here.
+    stats: dict[str, Any] = client.get("/stats", timeout=10).json()
+    return stats
+
+
 def check_not_banned(client: httpx.Client) -> CheckResult:
     """Direct check of the exact failure this whole project exists to
     prevent, rather than relying on it surfacing indirectly through a
@@ -91,15 +113,15 @@ def check_not_banned(client: httpx.Client) -> CheckResult:
     ban rather than being immediately obvious).
     """
     try:
-        stats = client.get("/stats", timeout=10).json()
-    except httpx.HTTPError as exc:
-        return CheckResult("not_banned", False, f"request failed: {exc}")
+        stats = _get_stats(client)
+        banned = {
+            market: info.get("seconds_until_unbanned")
+            for market, info in stats.get("markets", {}).items()
+            if info.get("banned")
+        }
+    except _STATS_ERRORS as exc:
+        return CheckResult("not_banned", False, f"could not read /stats: {exc!r}")
 
-    banned = {
-        market: info["seconds_until_unbanned"]
-        for market, info in stats.get("markets", {}).items()
-        if info.get("banned")
-    }
     ok = not banned
     detail = "no market banned" if ok else f"BANNED: {banned} (seconds remaining)"
     return CheckResult("not_banned", ok, detail)
@@ -167,8 +189,13 @@ def check_response_fidelity(
 # -- 4. cache-hit fidelity ----------------------------------------------------
 
 
-def _spot_upstream_calls(client: httpx.Client) -> int:
-    return int(client.get("/stats", timeout=10).json()["markets"]["spot"]["upstream_calls_made"])
+def _upstream_calls(client: httpx.Client, market: str) -> int:
+    """Reads /stats' upstream_calls_made counter for one market. Callers must
+    catch `_STATS_ERRORS` — same reasoning as `_get_stats`: a malformed body
+    here must not crash the whole monitor run.
+    """
+    stats = _get_stats(client)
+    return int(stats["markets"][market]["upstream_calls_made"])
 
 
 def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> CheckResult:
@@ -187,12 +214,12 @@ def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> Che
 
     try:
         client.get("/api/v3/klines", params=params, timeout=15)  # prime
-        before = _spot_upstream_calls(client)
+        before = _upstream_calls(client, "spot")
         cached_resp = client.get("/api/v3/klines", params=params, timeout=15).json()
-        after = _spot_upstream_calls(client)
+        after = _upstream_calls(client, "spot")
         real_resp = real.get(f"{REAL_SPOT_BASE}/api/v3/klines", params=params, timeout=15).json()
-    except httpx.HTTPError as exc:
-        return CheckResult("cache_served_fidelity", False, f"request failed: {exc}")
+    except _STATS_ERRORS as exc:
+        return CheckResult("cache_served_fidelity", False, f"request failed: {exc!r}")
 
     was_cache_served = after == before
     matches_real = cached_resp == real_resp
@@ -208,7 +235,7 @@ def check_cache_served_fidelity(client: httpx.Client, real: httpx.Client) -> Che
 # -- 5. error responses must be cached too, not retried every time ----------
 
 
-def check_error_responses_are_cached(client: httpx.Client) -> CheckResult:
+def check_error_responses_are_cached(client: httpx.Client, market: str) -> CheckResult:
     """Regression check for the actual, confirmed root cause of the
     2026-08-28 production ban (CLAUDE.md invariant #2): a request for a
     symbol invalid on the target market must not re-hit Binance on every
@@ -216,31 +243,40 @@ def check_error_responses_are_cached(client: httpx.Client) -> CheckResult:
     retried this way, uncached, was ~10% of all upstream calls and a
     direct, measurable contributor to that ban.
 
+    Runs against both spot and usdm_futures (run_all calls this twice) —
+    the actual incident was specifically ~546 invalid USD-M *futures*
+    symbols, so a regression that broke error-caching only for the futures
+    UpstreamClient/RateLimiter wiring while leaving spot fine would still
+    show a spot-only version of this check PASS.
+
     The invalid symbol includes the current timestamp so this check is
     never accidentally satisfied by a stale cache entry left over from a
     previous run (within CACHE_TTL_SECONDS) — that would make
     `first_call_made` false for a reason that has nothing to do with
     whether caching is actually working right now.
     """
+    proxy_path = "/api/v3/klines" if market == "spot" else "/fapi/v1/klines"
     params: dict[str, str | int] = {
         "symbol": f"NOTREALSYMBOL{_now_ms()}",
         "interval": "1m",
         "limit": 1,
     }
     try:
-        before = _spot_upstream_calls(client)
-        r1 = client.get("/api/v3/klines", params=params, timeout=15)
-        mid = _spot_upstream_calls(client)
-        r2 = client.get("/api/v3/klines", params=params, timeout=15)
-        after = _spot_upstream_calls(client)
-    except httpx.HTTPError as exc:
-        return CheckResult("error_responses_are_cached", False, f"request failed: {exc}")
+        before = _upstream_calls(client, market)
+        r1 = client.get(proxy_path, params=params, timeout=15)
+        mid = _upstream_calls(client, market)
+        r2 = client.get(proxy_path, params=params, timeout=15)
+        after = _upstream_calls(client, market)
+    except _STATS_ERRORS as exc:
+        return CheckResult(
+            f"error_responses_are_cached_{market}", False, f"request failed: {exc!r}"
+        )
 
     first_call_made = mid > before
     second_call_avoided = after == mid
     ok = first_call_made and second_call_avoided and r1.status_code == r2.status_code
     return CheckResult(
-        "error_responses_are_cached",
+        f"error_responses_are_cached_{market}",
         ok,
         f"first_call_made={first_call_made} second_call_avoided={second_call_avoided} "
         f"status={r1.status_code}",
@@ -288,7 +324,7 @@ def check_coalescing(client: httpx.Client, n: int = 15) -> CheckResult:
     }
 
     try:
-        before = _spot_upstream_calls(client)
+        before = _upstream_calls(client, "spot")
 
         async def fetch() -> object:
             async with httpx.AsyncClient(base_url=str(client.base_url)) as c:
@@ -296,9 +332,9 @@ def check_coalescing(client: httpx.Client, n: int = 15) -> CheckResult:
                 return r.json()
 
         results = asyncio.run(_gather_n(fetch, n))
-        after = _spot_upstream_calls(client)
-    except httpx.HTTPError as exc:
-        return CheckResult("coalescing", False, f"request failed: {exc}")
+        after = _upstream_calls(client, "spot")
+    except _STATS_ERRORS as exc:
+        return CheckResult("coalescing", False, f"request failed: {exc!r}")
 
     all_identical = all(r == results[0] for r in results)
     delta = after - before
@@ -331,7 +367,8 @@ def run_all(proxy_url: str, skip_code_quality: bool) -> list[CheckResult]:
             results.append(check_response_fidelity(client, real, "BTCUSDT", "spot"))
             results.append(check_response_fidelity(client, real, "BTCUSDT", "usdm_futures"))
             results.append(check_cache_served_fidelity(client, real))
-            results.append(check_error_responses_are_cached(client))
+            results.append(check_error_responses_are_cached(client, "spot"))
+            results.append(check_error_responses_are_cached(client, "usdm_futures"))
             results.append(check_malformed_input_does_not_crash(client))
             results.append(check_coalescing(client))
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 from collections.abc import Awaitable, Callable, Mapping
 
 logger = logging.getLogger(__name__)
@@ -109,9 +110,15 @@ class RateLimiter:
 
     def on_response(self, status_code: int, headers: Mapping[str, str]) -> None:
         """Reconcile weight usage and trip the breaker based on a real response."""
+        # Roll unconditionally, not only when a weight header is present — a
+        # ban response doesn't always carry one, and the warning log below
+        # reads _used_weight regardless. Without this, a 418 logged long
+        # after the last header-bearing response would report a stale
+        # figure from a prior window instead of the current one.
+        self._roll_window_if_expired()
+
         header_weight = _find_used_weight_header(headers)
         if header_weight is not None:
-            self._roll_window_if_expired()
             # The header is ground truth for "how much has actually been
             # used this window" — never let a stale lower local estimate
             # under-report it.
@@ -148,7 +155,16 @@ class RateLimiter:
         for key, value in headers.items():
             if key.lower() == "retry-after":
                 try:
-                    return float(value)
+                    parsed = float(value)
                 except (TypeError, ValueError):
                     break
+                # float("inf")/float("nan") parse without raising. inf would
+                # permanently brick the market (banned_until = now + inf);
+                # nan would silently defeat is_banned() entirely (every
+                # comparison against NaN is False) — worse than not tripping
+                # at all. Neither is a value Binance would legitimately send;
+                # fall back to the safe default instead of trusting either.
+                if not math.isfinite(parsed) or parsed < 0:
+                    break
+                return parsed
         return default

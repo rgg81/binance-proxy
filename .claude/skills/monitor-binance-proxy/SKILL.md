@@ -55,14 +55,21 @@ first, the same way you would for any bug report on this project.
    doesn't corrupt what it stores — it forces a cache-served response
    (proven via a zero-upstream-call signal) and compares that against real
    Binance, not just against the proxy's own earlier response.
-3. For an `error_responses_are_cached` failure: this is a regression check
-   for the *confirmed, actual root cause* of a real production 418 ban on
-   2026-08-28 — a caller repeatedly querying ~546 symbols invalid on
-   USD-M futures burned a fresh upstream call on every single retry
-   (~10% of all upstream calls) because errors weren't being cached
-   (CLAUDE.md invariant #2). A failure here means the proxy is back to
-   that exact wasteful, ban-contributing behavior — treat it as urgent,
-   not a flaky signal.
+3. For an `error_responses_are_cached_spot` or `error_responses_are_cached_usdm_futures`
+   failure (checked on both markets, since the actual incident was
+   futures-specific and a spot-only check could miss a futures-only
+   regression): this is a regression check for the *confirmed, actual root
+   cause* of a real production 418 ban on 2026-08-28 — a caller repeatedly
+   querying ~546 symbols invalid on USD-M futures burned a fresh upstream
+   call on every single retry (~10% of all upstream calls) because errors
+   weren't being cached (CLAUDE.md invariant #2). Before treating it as
+   urgent, re-run it once: the check reads `/stats`' `upstream_calls_made`
+   counter, which is shared with real production traffic — if a live
+   caller's own request happens to land in the few-millisecond window
+   between this check's two calls, that alone can bump the counter and
+   fail `second_call_avoided` with nothing actually wrong. A failure that
+   persists on a re-run, though, means the proxy is back to that exact
+   wasteful, ban-contributing behavior — treat that as urgent.
 4. For a `malformed_input_does_not_crash` failure: Binance is the sole
    source of truth for request validity here (CLAUDE.md invariant #5) —
    the proxy does no local validation, so a bad param must still relay
@@ -92,7 +99,16 @@ first, the same way you would for any bug report on this project.
    market, bypassing this proxy's rate limiter entirely (this was a real,
    confirmed contributing factor once already — grep other projects on
    this machine for hardcoded `api.binance.com`/`fapi.binance.com`).
-   Always alert on this, regardless of what caused it.
+   Investigate every occurrence — but the log line from invariant #8 tells
+   you which kind you're looking at, and that changes how urgently to
+   escalate: a `429` trip backs off for a short, self-clearing default
+   (5s) and is Binance's ordinary throttling working as intended, while a
+   `418` trip is the actual IP ban this project exists to prevent, with a
+   far longer duration (Binance-specified via `Retry-After`, or a
+   120s-minimum default). `seconds_until_unbanned` in `/stats` reflects
+   whichever tripped it. A monitor run that happens to land inside a brief
+   429 backoff is a real but minor finding, worth noting in the report;
+   a 418 ban is always urgent and always worth a push notification.
 
 Once you've determined it's a real problem, send a push notification with
 a concise, specific summary — this is exactly the kind of thing worth
